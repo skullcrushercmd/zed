@@ -275,6 +275,7 @@ pub enum Event {
     WorktreeAdded,
     WorktreeRemoved(WorktreeId),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
+    WorktreeUpdatedGitRepositories(WorktreeId),
     DiskBasedDiagnosticsStarted {
         language_server_id: LanguageServerId,
     },
@@ -6806,8 +6807,15 @@ impl Project {
                 }
                 worktree::Event::UpdatedGitRepositories(updated_repos) => {
                     if is_local {
-                        this.update_local_worktree_buffers_git_repos(worktree, updated_repos, cx)
+                        this.update_local_worktree_buffers_git_repos(
+                            worktree.clone(),
+                            updated_repos,
+                            cx,
+                        )
                     }
+                    cx.emit(Event::WorktreeUpdatedGitRepositories(
+                        worktree.read(cx).id(),
+                    ));
                 }
             }
         })
@@ -7099,6 +7107,7 @@ impl Project {
                             let repo = snapshot.get_local_repo(&repo)?;
                             let relative_path = path.strip_prefix(&work_directory).ok()?;
                             let base_text = repo.load_index_text(relative_path);
+
                             Some((buffer, base_text))
                         })
                         .collect::<Vec<_>>()
