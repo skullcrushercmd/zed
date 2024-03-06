@@ -329,7 +329,7 @@ impl GitRepository for FakeGitRepository {
         Ok(())
     }
 
-    fn blame_path(&self, path: &Path) -> Result<git2::Blame<'_>> {
+    fn blame_path(&self, _: &Path) -> Result<git2::Blame<'_>> {
         Err(anyhow!("not implemented"))
     }
 }

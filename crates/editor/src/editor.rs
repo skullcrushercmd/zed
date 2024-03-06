@@ -8764,16 +8764,15 @@ impl Editor {
             .update(git_repo, file, self.text(cx))
             .log_err()?;
 
-        let refresh_subscription =
-            cx.subscribe(&project_handle, |editor, _, event, _| match event {
-                project::Event::WorktreeUpdatedGitRepositories(_) => {
-                    println!(
-                        "WorktreeUpdatedGitRepositories. Update blame data. event: {:?}",
-                        event
-                    );
-                }
-                _ => {}
-            });
+        let refresh_subscription = cx.subscribe(&project_handle, |_, _, event, _| match event {
+            project::Event::WorktreeUpdatedGitRepositories(_) => {
+                println!(
+                    "WorktreeUpdatedGitRepositories. Update blame data. event: {:?}",
+                    event
+                );
+            }
+            _ => {}
+        });
 
         self.blame = Some(BlameState {
             blame: buffer_blame,

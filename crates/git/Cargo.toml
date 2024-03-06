@@ -22,6 +22,7 @@ sum_tree.workspace = true
 text.workspace = true
 fs.workspace = true
 parking_lot.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 unindent.workspace = true

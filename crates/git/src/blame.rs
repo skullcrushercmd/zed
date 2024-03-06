@@ -1,10 +1,12 @@
 use fs::repository::GitRepository;
 
 use anyhow::Result;
+use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
 use libgit::Oid;
 use parking_lot::Mutex;
 use std::{ops::Range, path::Path, sync::Arc};
 use sum_tree::SumTree;
+
 use text::Anchor;
 
 pub use git2 as libgit;
@@ -92,43 +94,49 @@ impl BufferBlame {
         let blame = repo.blame_path(path)?;
         let blame_buffer = blame.blame_buffer(buffer.as_bytes())?;
 
-        let lines = buffer.lines().collect::<Vec<&str>>();
+        for (idx, line) in buffer.lines().enumerate() {
+            println!("buffer line {idx}");
+            match blame_buffer.get_line(idx + 1) {
+                Some(hunk) => {
+                    let commit_id = hunk.final_commit_id();
+                    let uncommitted = commit_id == git2::Oid::zero();
+                    if uncommitted {
+                        println!("uncommitted - {}", line);
+                    } else {
+                        let final_signature = hunk.final_signature();
+                        let name = final_signature.name().unwrap_or_default();
+                        let email = final_signature.email().unwrap_or_default();
 
-        for blame_hunk in blame_buffer.iter() {
-            let start_line = blame_hunk.final_start_line();
-            let lines_in_hunk = blame_hunk.lines_in_hunk();
+                        let when = hunk.final_signature().when();
+                        let datetime = git_time_to_chrono(when)
+                            .map(|datetime| datetime.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| format!("unknown!"));
 
-            if dbg!(dbg!(lines_in_hunk) == usize::MAX) {
-                continue;
+                        let pretty_commit_id = format!("{}", commit_id);
+                        let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
+
+                        println!(
+                            "{} - {} <{}> - ({}) - {}",
+                            short_commit_id, name, email, datetime, line
+                        );
+                    }
+                }
+                None => {
+                    println!("no commit found - {line}");
+                }
             }
-
-            dbg!(start_line, lines_in_hunk);
-            // let end_line = if lines_in_hunk == 0 {
-            //     start_line - 1
-            // } else {
-            //     start_line + lines_in_hunk - 1
-            // };
-            // let hunk_lines = &lines[start_line - 1..end_line];
-
-            // let commit_id = blame_hunk.final_commit_id();
-            // let uncommitted = commit_id == git2::Oid::zero();
-            // for line in hunk_lines {
-            //     if uncommitted {
-            //         println!(
-            //             "{} - NOT COMMITTED - {}",
-            //             blame_hunk.final_commit_id(),
-            //             line
-            //         );
-            //     } else {
-            //         println!(
-            //             "{} - {:?} - {}",
-            //             blame_hunk.final_commit_id(),
-            //             blame_hunk.final_signature().name(),
-            //             line
-            //         );
-            //     }
-            // }
         }
+
         Ok(())
+    }
+}
+
+fn git_time_to_chrono(time: libgit::Time) -> Option<DateTime<FixedOffset>> {
+    let offset_seconds = time.offset_minutes() * 60; // convert minutes to seconds
+    let fixed_offset = FixedOffset::east_opt(offset_seconds)?;
+
+    match fixed_offset.timestamp_opt(time.seconds(), 0) {
+        LocalResult::Single(datetime) => Some(datetime),
+        _ => None, // you might want to handle this case differently, depending on your needs
     }
 }
