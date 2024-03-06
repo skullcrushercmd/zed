@@ -4,10 +4,10 @@ use anyhow::Result;
 use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
 use libgit::Oid;
 use parking_lot::Mutex;
-use std::{ops::Range, path::Path, sync::Arc};
+use std::{fmt, ops::Range, path::Path, sync::Arc};
 use sum_tree::SumTree;
 
-use text::Anchor;
+use text::{Anchor, Point};
 
 pub use git2 as libgit;
 
@@ -33,9 +33,13 @@ pub use git2 as libgit;
 // the `Anchor`s into `Point`s. The `payload` is the diff information.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlameHunk<T> {
-    pub buffer_range: Range<T>,
-    pub commit: Oid,
+struct BlameHunk<T> {
+    buffer_range: Range<T>,
+
+    oid: libgit::Oid,
+    name: String,
+    email: String,
+    time: DateTime<FixedOffset>,
 }
 
 impl BlameHunk<u32> {}
@@ -47,6 +51,21 @@ impl sum_tree::Item for BlameHunk<Anchor> {
         BlameHunkSummary {
             buffer_range: self.buffer_range.clone(),
         }
+    }
+}
+
+impl<T> fmt::Display for BlameHunk<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
+        let datetime = self.time.format("%Y-%m-%d %H:%M").to_string();
+
+        let pretty_commit_id = format!("{}", self.oid);
+        let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
+
+        write!(
+            f,
+            "{} - {} <{}> - ({})",
+            short_commit_id, self.name, self.email, datetime
+        )
     }
 }
 
@@ -94,40 +113,61 @@ impl BufferBlame {
         let blame = repo.blame_path(path)?;
         let blame_buffer = blame.blame_buffer(buffer.as_bytes())?;
 
-        for (idx, line) in buffer.lines().enumerate() {
-            println!("buffer line {idx}");
-            match blame_buffer.get_line(idx + 1) {
-                Some(hunk) => {
-                    let commit_id = hunk.final_commit_id();
-                    let uncommitted = commit_id == git2::Oid::zero();
-                    if uncommitted {
-                        println!("uncommitted - {}", line);
-                    } else {
-                        let final_signature = hunk.final_signature();
-                        let name = final_signature.name().unwrap_or_default();
-                        let email = final_signature.email().unwrap_or_default();
-
-                        let when = hunk.final_signature().when();
-                        let datetime = git_time_to_chrono(when)
-                            .map(|datetime| datetime.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_else(|| format!("unknown!"));
-
-                        let pretty_commit_id = format!("{}", commit_id);
-                        let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
-
-                        println!(
-                            "{} - {} <{}> - ({}) - {}",
-                            short_commit_id, name, email, datetime, line
-                        );
-                    }
-                }
-                None => {
-                    println!("no commit found - {line}");
-                }
+        for hunk_index in 0..blame_buffer.len() {
+            let hunk = Self::process_blame_hunk(&blame_buffer, hunk_index, &buffer);
+            match hunk {
+                Some(hunk) => println!("hunk {hunk_index}: {}", hunk),
+                None => {}
             }
         }
 
         Ok(())
+    }
+
+    fn process_blame_hunk(
+        blame: &libgit::Blame<'_>,
+        hunk_index: usize,
+        buffer: &String,
+    ) -> Option<BlameHunk<u32>> {
+        let Some(hunk) = blame.get_index(hunk_index) else {
+            println!("no hunk {hunk_index} found");
+            return None;
+        };
+
+        let oid = hunk.final_commit_id();
+        if oid == git2::Oid::zero() {
+            let start_line = hunk.final_start_line();
+            let line_count = hunk.lines_in_hunk();
+            println!("hunk start_line={start_line} (line_count={line_count}) -- not committed!");
+            return None;
+        }
+
+        let start_line = hunk.final_start_line();
+        let line_count = hunk.lines_in_hunk();
+        if line_count == usize::MAX {
+            // Not sure when this happens.
+            println!("what the hell");
+            return None;
+        }
+
+        // TODO: This is wrong. We need to figure out whether this is in the buffer
+        let start = (start_line as u32) - 1;
+        let end = (start_line as u32) - 1 + (line_count as u32);
+        let buffer_range = start..end;
+
+        let final_signature = hunk.final_signature();
+        let name = final_signature.name()?.to_string();
+        let email = final_signature.email()?.to_string();
+        let when = hunk.final_signature().when();
+        let time = git_time_to_chrono(when)?;
+
+        Some(BlameHunk {
+            oid,
+            name,
+            email,
+            time,
+            buffer_range,
+        })
     }
 }
 
