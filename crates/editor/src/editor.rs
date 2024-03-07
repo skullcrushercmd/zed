@@ -8753,15 +8753,18 @@ impl Editor {
     }
 
     fn show_git_blame_internal(&mut self, cx: &mut ViewContext<Self>) -> Option<()> {
+        // TODO: Make this async and move in background
         let project_handle = self.project.as_ref()?.clone();
         let project = project_handle.read(cx);
         let buffer = self.buffer().read(cx).as_singleton()?;
         let file = buffer.read(cx).file()?.as_local()?.path();
         let git_repo = project.get_repo(&buffer.read(cx).project_path(cx)?, cx)?;
 
+        let buffer_snapshot = buffer.read(cx).snapshot();
+
         let mut buffer_blame = BufferBlame::new();
         buffer_blame
-            .update(git_repo, file, self.text(cx))
+            .update(git_repo, file, &buffer_snapshot)
             .log_err()?;
 
         let refresh_subscription = cx.subscribe(&project_handle, |_, _, event, _| match event {

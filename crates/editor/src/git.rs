@@ -2,7 +2,10 @@ pub mod permalink;
 
 use std::ops::Range;
 
-use git::diff::{DiffHunk, DiffHunkStatus};
+use git::{
+    blame::BlameHunk,
+    diff::{DiffHunk, DiffHunkStatus},
+};
 use language::Point;
 
 use crate::{
@@ -87,6 +90,56 @@ pub fn diff_hunk_to_display(hunk: DiffHunk<u32>, snapshot: &DisplaySnapshot) -> 
             display_row_range: start..end,
             status: hunk.status(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisplayBlameHunk {
+    Folded {
+        display_row: u32,
+    },
+
+    Unfolded {
+        display_row_range: Range<u32>,
+        blame_hunk: BlameHunk<u32>,
+    },
+}
+
+impl DisplayBlameHunk {
+    pub fn start_display_row(&self) -> u32 {
+        match self {
+            &DisplayBlameHunk::Folded { display_row } => display_row,
+            DisplayBlameHunk::Unfolded {
+                display_row_range, ..
+            } => display_row_range.start,
+        }
+    }
+
+    pub fn contains_display_row(&self, display_row: u32) -> bool {
+        let range = match self {
+            &DisplayBlameHunk::Folded { display_row } => display_row..=display_row,
+
+            DisplayBlameHunk::Unfolded {
+                display_row_range, ..
+            } => display_row_range.start..=display_row_range.end,
+        };
+
+        range.contains(&display_row)
+    }
+}
+
+pub fn blame_hunk_to_display(hunk: BlameHunk<u32>, snapshot: &DisplaySnapshot) -> DisplayBlameHunk {
+    // TODO: This is all wrong, I bet
+    let hunk_start_point = Point::new(hunk.buffer_range.start, 0);
+
+    let start = hunk_start_point.to_display_point(snapshot).row();
+    let hunk_end_row = hunk.buffer_range.end.max(hunk.buffer_range.start);
+    let hunk_end_point = Point::new(hunk_end_row, 0);
+    let end = hunk_end_point.to_display_point(snapshot).row();
+
+    DisplayBlameHunk::Unfolded {
+        display_row_range: start..end,
+        blame_hunk: hunk,
     }
 }
 

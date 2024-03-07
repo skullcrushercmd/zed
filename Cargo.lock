@@ -4265,6 +4265,7 @@ dependencies = [
  "sum_tree",
  "text",
  "unindent",
+ "util",
 ]
 
 [[package]]

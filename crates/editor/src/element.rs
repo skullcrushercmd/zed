@@ -4,7 +4,7 @@ use crate::{
         TransformBlock,
     },
     editor_settings::ShowScrollbar,
-    git::{diff_hunk_to_display, DisplayDiffHunk},
+    git::{blame_hunk_to_display, diff_hunk_to_display, DisplayBlameHunk, DisplayDiffHunk},
     hover_popover::{
         self, hover_at, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
     },
@@ -18,7 +18,7 @@ use crate::{
 };
 use anyhow::Result;
 use collections::{BTreeMap, HashMap};
-use git::diff::DiffHunkStatus;
+use git::{blame::BufferBlame, diff::DiffHunkStatus};
 use gpui::{
     div, fill, outline, overlay, point, px, quad, relative, size, transparent_black, Action,
     AnchorCorner, AnyElement, AvailableSpace, Bounds, ContentMask, Corners, CursorStyle,
@@ -734,6 +734,11 @@ impl EditorElement {
             Self::paint_diff_hunks(bounds, layout, cx);
         }
 
+        // TODO: There has to be a better way. Do we need to check on `layout.display_blame_hunks`?
+        if self.editor.update(cx, |editor, _| editor.blame.is_some()) {
+            Self::paint_blame_hunks(bounds, layout, cx)
+        }
+
         let gutter_settings = EditorSettings::get_global(cx).gutter;
 
         for (ix, line) in layout.line_numbers.iter().enumerate() {
@@ -893,6 +898,68 @@ impl EditorElement {
                 Edges::default(),
                 transparent_black(),
             ));
+        }
+    }
+
+    fn paint_blame_hunks(bounds: Bounds<Pixels>, layout: &LayoutState, cx: &mut ElementContext) {
+        let line_height = layout.position_map.line_height;
+
+        let scroll_position = layout.position_map.snapshot.scroll_position();
+        let scroll_top = scroll_position.y * line_height;
+
+        let Some(display_blame_hunks) = layout.display_blame_hunks.as_ref() else {
+            return;
+        };
+
+        for hunk in display_blame_hunks {
+            let (display_row_range, hunk) = match hunk {
+                &DisplayBlameHunk::Folded { display_row: row } => {
+                    //TODO: what?
+                    continue;
+                }
+
+                DisplayBlameHunk::Unfolded {
+                    display_row_range,
+                    blame_hunk,
+                } => (display_row_range, blame_hunk),
+            };
+
+            let start_row = display_row_range.start;
+            let end_row = display_row_range.end;
+            // If we're in a multibuffer, row range span might include an
+            // excerpt header, so if we were to draw the marker straight away,
+            // the hunk might include the rows of that header.
+            // Making the range inclusive doesn't quite cut it, as we rely on the exclusivity for the soft wrap.
+            // Instead, we simply check whether the range we're dealing with includes
+            // any excerpt headers and if so, we stop painting the diff hunk on the first row of that header.
+            let end_row_in_current_excerpt = layout
+                .position_map
+                .snapshot
+                .blocks_in_range(start_row..end_row)
+                .find_map(|(start_row, block)| {
+                    if matches!(block, TransformBlock::ExcerptHeader { .. }) {
+                        Some(start_row)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(end_row);
+
+            let start_y = start_row as f32 * line_height - scroll_top;
+            let end_y = end_row_in_current_excerpt as f32 * line_height - scroll_top;
+
+            println!("position: start_y={start_y:?}, end_y={end_y:?}, painting blame hunk: {hunk}");
+            // let width = 0.275 * line_height;
+            // let highlight_origin = bounds.origin + point(-width, start_y);
+            // let highlight_size = size(width * 2., end_y - start_y);
+            // let highlight_bounds = Bounds::new(highlight_origin, highlight_size);
+            // cx.paint_quad(quad(
+            //     highlight_bounds,
+            //     Corners::all(0.05 * line_height),
+            //     color,
+            //     Edges::default(),
+            //     transparent_black(),
+            // ));
         }
     }
 
@@ -1784,6 +1851,30 @@ impl EditorElement {
             .collect()
     }
 
+    fn layout_git_blame_gutters(
+        &self,
+        blame: &BufferBlame,
+        display_rows: Range<u32>,
+        snapshot: &EditorSnapshot,
+    ) -> Vec<DisplayBlameHunk> {
+        // TODO: Doesn't work in multibuffer then?
+        if let Some((_, _, buffer_snapshot)) = &snapshot.buffer_snapshot.as_singleton() {
+            let buffer_start_row = DisplayPoint::new(display_rows.start, 0)
+                .to_point(snapshot)
+                .row;
+            let buffer_end_row = DisplayPoint::new(display_rows.end, 0)
+                .to_point(snapshot)
+                .row;
+
+            blame
+                .hunks_in_row_range(buffer_start_row..buffer_end_row, buffer_snapshot)
+                .map(|hunk| blame_hunk_to_display(hunk, snapshot))
+                .collect()
+        } else {
+            Vec::default()
+        }
+    }
+
     fn calculate_relative_line_numbers(
         &self,
         snapshot: &EditorSnapshot,
@@ -2233,6 +2324,11 @@ impl EditorElement {
             );
 
             let display_hunks = self.layout_git_gutters(start_row..end_row, &snapshot);
+            let display_blame_hunks = if let Some(blame_state) = editor.blame.as_ref() {
+                Some(self.layout_git_blame_gutters(&blame_state.blame, start_row..end_row, &snapshot))
+            } else {
+                None
+            };
 
             let scrollbar_row_range = scroll_position.y..(scroll_position.y + height_in_lines);
 
@@ -2431,6 +2527,7 @@ impl EditorElement {
                 redacted_ranges,
                 line_numbers,
                 display_hunks,
+                display_blame_hunks,
                 blocks,
                 selections,
                 context_menu,
@@ -3207,6 +3304,7 @@ pub struct LayoutState {
     highlighted_rows: Option<Range<u32>>,
     line_numbers: Vec<Option<ShapedLine>>,
     display_hunks: Vec<DisplayDiffHunk>,
+    display_blame_hunks: Option<Vec<DisplayBlameHunk>>,
     blocks: Vec<BlockLayout>,
     highlighted_ranges: Vec<(Range<DisplayPoint>, Hsla)>,
     redacted_ranges: Vec<Range<DisplayPoint>>,
