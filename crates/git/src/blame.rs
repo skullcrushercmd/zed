@@ -1,4 +1,6 @@
 use fs::repository::GitRepository;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::iter;
 
 use anyhow::anyhow;
@@ -43,6 +45,12 @@ pub struct BlameHunk<T> {
     pub name: Option<String>,
     pub email: Option<String>,
     pub time: DateTime<FixedOffset>,
+}
+
+struct Signature {
+    name: Option<String>,
+    email: Option<String>,
+    time: DateTime<FixedOffset>,
 }
 
 impl<T> BlameHunk<T> {
@@ -187,10 +195,12 @@ impl BufferBlame {
         let blame_buffer = blame.blame_buffer(buffer_text.as_bytes())?;
 
         let mut tree = SumTree::new();
+        let mut signatures = HashMap::default();
         for hunk_index in 0..blame_buffer.len() {
-            let hunk = Self::process_blame_hunk(&blame_buffer, hunk_index, &buffer)
-                .log_err()
-                .flatten();
+            let hunk =
+                Self::process_blame_hunk(&blame_buffer, hunk_index, &buffer, &mut signatures)
+                    .log_err()
+                    .flatten();
             if let Some(hunk) = hunk {
                 tree.push(hunk, buffer);
             }
@@ -206,6 +216,7 @@ impl BufferBlame {
         blame: &libgit::Blame<'_>,
         hunk_index: usize,
         buffer: &text::BufferSnapshot,
+        signatures: &mut HashMap<libgit::Oid, Signature>,
     ) -> Result<Option<BlameHunk<Anchor>>> {
         let Some(hunk) = blame.get_index(hunk_index) else {
             return Ok(None);
@@ -229,19 +240,33 @@ impl BufferBlame {
         let end = Point::new(start_line + line_count, 0);
         let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
 
-        let final_signature = hunk.final_signature();
-        let name = final_signature.name().map(String::from);
-        let email = final_signature.email().map(String::from);
-        let when = hunk.final_signature().when();
-        let time = git_time_to_chrono(when)?;
+        if let Some(signature) = signatures.get(&oid) {
+            Ok(Some(BlameHunk {
+                oid,
+                name: signature.name.clone(),
+                email: signature.email.clone(),
+                time: signature.time.clone(),
+                buffer_range,
+            }))
+        } else {
+            let final_signature = hunk.final_signature();
+            let name = final_signature.name().map(String::from);
+            let email = final_signature.email().map(String::from);
+            let when = hunk.final_signature().when();
+            let time = git_time_to_chrono(when)?;
 
-        Ok(Some(BlameHunk {
-            oid,
-            name,
-            email,
-            time,
-            buffer_range,
-        }))
+            let signature = Signature { name, email, time };
+            let blame_hunk = BlameHunk {
+                oid,
+                name: signature.name.clone(),
+                email: signature.email.clone(),
+                time: signature.time.clone(),
+                buffer_range,
+            };
+            signatures.insert(oid, signature);
+
+            Ok(Some(blame_hunk))
+        }
     }
 }
 

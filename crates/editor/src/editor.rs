@@ -426,6 +426,7 @@ pub struct Editor {
     show_copilot_suggestions: bool,
     use_autoclose: bool,
     auto_replace_emoji_shortcode: bool,
+    show_git_blame: bool,
     blame: Option<BlameState>,
     custom_context_menu: Option<
         Box<
@@ -1565,6 +1566,7 @@ impl Editor {
             editor_actions: Default::default(),
             show_copilot_suggestions: mode == EditorMode::Full,
             custom_context_menu: None,
+            show_git_blame: false,
             blame: None,
             _subscriptions: vec![
                 cx.observe(&buffer, Self::on_buffer_changed),
@@ -8745,15 +8747,23 @@ impl Editor {
         }
     }
 
-    pub fn show_git_blame(&mut self, _: &ShowGitBlame, cx: &mut ViewContext<Self>) {
-        match self.show_git_blame_internal(cx) {
-            Some(()) => {
-                println!("it worked!");
-            }
-            None => {
-                println!("no git blame :(");
-            }
+    pub fn toggle_git_blame(&mut self, _: &ToggleGitBlame, cx: &mut ViewContext<Self>) {
+        self.show_git_blame = !self.show_git_blame;
+
+        if self.show_git_blame {
+            match self.show_git_blame_internal(cx) {
+                Some(()) => {
+                    println!("showing git blame. it worked!");
+                }
+                None => {
+                    println!("no git blame :(");
+                }
+            };
+        } else {
+            self.blame.take();
         }
+
+        cx.notify();
     }
 
     fn show_git_blame_internal(&mut self, cx: &mut ViewContext<Self>) -> Option<()> {
@@ -8785,9 +8795,6 @@ impl Editor {
             blame: buffer_blame,
             refresh_subscription,
         });
-
-        cx.notify();
-
         Some(())
     }
 
