@@ -14,7 +14,7 @@ use crate::{
     CursorShape, DisplayPoint, DocumentHighlightRead, DocumentHighlightWrite, Editor, EditorMode,
     EditorSettings, EditorSnapshot, EditorStyle, GutterDimensions, HalfPageDown, HalfPageUp,
     HoveredCursor, LineDown, LineUp, OpenExcerpts, PageDown, PageUp, Point, SelectPhase, Selection,
-    SoftWrap, ToPoint, CURSORS_VISIBLE_FOR, MAX_LINE_LEN,
+    SoftWrap, ToPoint, CURSORS_VISIBLE_FOR, GIT_BLAME_GUTTER_WIDTH_CHARS, MAX_LINE_LEN,
 };
 use anyhow::Result;
 use collections::{BTreeMap, HashMap};
@@ -787,12 +787,21 @@ impl EditorElement {
                 );
                 let indicator_size = button.measure(available_space, cx);
 
-                let mut x = Pixels::ZERO;
-                let mut y = indicator.row as f32 * line_height - scroll_top;
+                let mut x = if layout.display_blame_hunks.is_some() {
+                    GIT_BLAME_GUTTER_WIDTH_CHARS * layout.position_map.em_width
+                } else {
+                    Pixels::ZERO
+                };
+                let mut available_width = layout.gutter_dimensions.margin
+                    + layout.gutter_dimensions.left_padding
+                    - indicator_size.width;
+                if layout.display_blame_hunks.is_some() {
+                    available_width -= GIT_BLAME_GUTTER_WIDTH_CHARS * layout.position_map.em_width;
+                }
                 // Center indicator.
-                x += (layout.gutter_dimensions.margin + layout.gutter_dimensions.left_padding
-                    - indicator_size.width)
-                    / 2.;
+                x += available_width / 2.;
+
+                let mut y = indicator.row as f32 * line_height - scroll_top;
                 y += (line_height - indicator_size.height) / 2.;
 
                 button.draw(bounds.origin + point(x, y), available_space, cx);
@@ -931,6 +940,7 @@ impl EditorElement {
 
             let sha_bytes = blame_hunk.oid.as_bytes();
             debug_assert!(sha_bytes.len() > 4);
+
             let sha_number =
                 u32::from_ne_bytes([sha_bytes[0], sha_bytes[1], sha_bytes[2], sha_bytes[3]]);
             let sha_color = cx.theme().players().color_for_participant(sha_number);
@@ -955,7 +965,7 @@ impl EditorElement {
 
             for row in display_row_range.start..display_row_range.end {
                 let start_y = row as f32 * line_height - scroll_top;
-                let start_x = layout.position_map.em_width * 2;
+                let start_x = layout.position_map.em_width * 1;
 
                 let origin = bounds.origin + point(start_x, start_y);
 

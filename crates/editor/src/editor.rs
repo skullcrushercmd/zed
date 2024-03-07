@@ -451,6 +451,8 @@ pub struct EditorSnapshot {
     ongoing_scroll: OngoingScroll,
 }
 
+pub(crate) const GIT_BLAME_GUTTER_WIDTH_CHARS: Pixels = Pixels(55.0);
+
 pub struct GutterDimensions {
     pub left_padding: Pixels,
     pub right_padding: Pixels,
@@ -9907,7 +9909,7 @@ impl EditorSnapshot {
         };
 
         let left_padding = if show_git_blame {
-            em_width * 50.0
+            em_width * GIT_BLAME_GUTTER_WIDTH_CHARS
         } else if gutter_settings.code_actions {
             em_width * 3.0
         } else if show_git_gutter && gutter_settings.line_numbers {
