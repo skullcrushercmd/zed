@@ -1,5 +1,4 @@
 use fs::repository::GitRepository;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::iter;
 
@@ -114,6 +113,15 @@ pub struct BufferBlame {
 }
 
 impl BufferBlame {
+    pub fn new_with_cli(path: &Arc<Path>, buffer_contents: &String) -> BufferBlame {
+        println!("path: {}", path.display());
+        println!("buffer_contents: {}", buffer_contents);
+        BufferBlame {
+            last_buffer_version: None,
+            tree: SumTree::new(),
+        }
+    }
+
     pub fn new() -> BufferBlame {
         BufferBlame {
             last_buffer_version: None,
@@ -190,9 +198,23 @@ impl BufferBlame {
     ) -> Result<()> {
         let repo = repo.lock();
 
+        let start_time = std::time::Instant::now();
         let blame = repo.blame_path(path)?;
         let buffer_text = buffer.as_rope().to_string();
         let blame_buffer = blame.blame_buffer(buffer_text.as_bytes())?;
+        println!("Execution time: {:?}", start_time.elapsed());
+
+        // for (line_idx, line) in buffer_text.lines().enumerate() {
+        //     if let Some(hunk) = blame_buffer.get_line(line_idx + 1) {
+        //         println!(
+        //             "line: {}, oid: {}, start: {}, line count: {}",
+        //             line_idx,
+        //             hunk.final_commit_id(),
+        //             hunk.final_start_line(),
+        //             hunk.lines_in_hunk()
+        //         );
+        //     }
+        // }
 
         let mut tree = SumTree::new();
         let mut signatures = HashMap::default();
@@ -224,7 +246,18 @@ impl BufferBlame {
 
         let oid = hunk.final_commit_id();
         if oid.is_zero() {
+            println!(
+                "zero commit, start: {}, line count: {}",
+                hunk.final_start_line(),
+                hunk.lines_in_hunk()
+            );
             return Ok(None);
+        } else {
+            println!(
+                "non-zero commit, start: {}, line_count: {}",
+                hunk.final_start_line(),
+                hunk.lines_in_hunk()
+            );
         }
 
         let line_count = hunk.lines_in_hunk();
@@ -238,6 +271,8 @@ impl BufferBlame {
 
         let start = Point::new(start_line, 0);
         let end = Point::new(start_line + line_count, 0);
+
+        println!("{}, start: {}, end: {}", oid, start.row, end.row);
         let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
 
         if let Some(signature) = signatures.get(&oid) {

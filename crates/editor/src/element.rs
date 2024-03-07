@@ -941,8 +941,7 @@ impl EditorElement {
             let sha_bytes = blame_hunk.oid.as_bytes();
             debug_assert!(sha_bytes.len() > 4);
 
-            let sha_number =
-                u32::from_ne_bytes([sha_bytes[0], sha_bytes[1], sha_bytes[2], sha_bytes[3]]);
+            let sha_number = u32::from_ne_bytes(sha_bytes[..4].try_into().unwrap());
             let sha_color = cx.theme().players().color_for_participant(sha_number);
 
             let commit_sha_run = TextRun {
@@ -953,6 +952,7 @@ impl EditorElement {
                 underline: Default::default(),
                 strikethrough: None,
             };
+
             let info_run = TextRun {
                 len: blame_line.len() - 6,
                 font: self.style.text.font(),

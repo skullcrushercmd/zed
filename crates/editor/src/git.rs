@@ -118,7 +118,7 @@ impl fmt::Display for DisplayBlameHunk {
 
                 write!(
                     f,
-                    "{} - {} - {}",
+                    "{} {} ({})",
                     short_commit_id,
                     blame_hunk.name.as_deref().unwrap_or("<no name>"),
                     datetime
