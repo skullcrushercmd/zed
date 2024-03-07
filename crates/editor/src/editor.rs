@@ -812,6 +812,9 @@ impl CompletionsMenu {
         if !settings.show_completion_documentation {
             return;
         }
+        // this is newly inserted
+        // and this too?  
+
 
         let completion_index = self.matches[self.selected_item].candidate_id;
         let Some(project) = project else {
