@@ -734,9 +734,8 @@ impl EditorElement {
             Self::paint_diff_hunks(bounds, layout, cx);
         }
 
-        // TODO: There has to be a better way. Do we need to check on `layout.display_blame_hunks`?
-        if self.editor.update(cx, |editor, _| editor.blame.is_some()) {
-            Self::paint_blame_hunks(bounds, layout, cx)
+        if layout.display_blame_hunks.is_some() {
+            self.paint_blame_hunks(bounds, layout, cx);
         }
 
         let gutter_settings = EditorSettings::get_global(cx).gutter;
@@ -901,7 +900,12 @@ impl EditorElement {
         }
     }
 
-    fn paint_blame_hunks(bounds: Bounds<Pixels>, layout: &LayoutState, cx: &mut ElementContext) {
+    fn paint_blame_hunks(
+        &self,
+        bounds: Bounds<Pixels>,
+        layout: &LayoutState,
+        cx: &mut ElementContext,
+    ) {
         let line_height = layout.position_map.line_height;
 
         let scroll_position = layout.position_map.snapshot.scroll_position();
@@ -912,54 +916,58 @@ impl EditorElement {
         };
 
         for hunk in display_blame_hunks {
-            let (display_row_range, hunk) = match hunk {
-                &DisplayBlameHunk::Folded { display_row: row } => {
-                    //TODO: what?
+            let (blame_hunk, display_row_range) = match hunk {
+                &DisplayBlameHunk::Folded { .. } => {
+                    // TODO: what?
                     continue;
                 }
-
                 DisplayBlameHunk::Unfolded {
                     display_row_range,
                     blame_hunk,
-                } => (display_row_range, blame_hunk),
+                } => (blame_hunk, display_row_range),
             };
 
-            let start_row = display_row_range.start;
-            let end_row = display_row_range.end;
-            // If we're in a multibuffer, row range span might include an
-            // excerpt header, so if we were to draw the marker straight away,
-            // the hunk might include the rows of that header.
-            // Making the range inclusive doesn't quite cut it, as we rely on the exclusivity for the soft wrap.
-            // Instead, we simply check whether the range we're dealing with includes
-            // any excerpt headers and if so, we stop painting the diff hunk on the first row of that header.
-            let end_row_in_current_excerpt = layout
-                .position_map
-                .snapshot
-                .blocks_in_range(start_row..end_row)
-                .find_map(|(start_row, block)| {
-                    if matches!(block, TransformBlock::ExcerptHeader { .. }) {
-                        Some(start_row)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(end_row);
+            let blame_line = format!("{}", hunk);
 
-            let start_y = start_row as f32 * line_height - scroll_top;
-            let end_y = end_row_in_current_excerpt as f32 * line_height - scroll_top;
+            let sha_bytes = blame_hunk.oid.as_bytes();
+            debug_assert!(sha_bytes.len() > 4);
+            let sha_number =
+                u32::from_ne_bytes([sha_bytes[0], sha_bytes[1], sha_bytes[2], sha_bytes[3]]);
+            let sha_color = cx.theme().players().color_for_participant(sha_number);
 
-            println!("position: start_y={start_y:?}, end_y={end_y:?}, painting blame hunk: {hunk}");
-            // let width = 0.275 * line_height;
-            // let highlight_origin = bounds.origin + point(-width, start_y);
-            // let highlight_size = size(width * 2., end_y - start_y);
-            // let highlight_bounds = Bounds::new(highlight_origin, highlight_size);
-            // cx.paint_quad(quad(
-            //     highlight_bounds,
-            //     Corners::all(0.05 * line_height),
-            //     color,
-            //     Edges::default(),
-            //     transparent_black(),
-            // ));
+            let commit_sha_run = TextRun {
+                len: 6,
+                font: self.style.text.font(),
+                color: sha_color.cursor,
+                background_color: None,
+                underline: Default::default(),
+                strikethrough: None,
+            };
+            let info_run = TextRun {
+                len: blame_line.len() - 6,
+                font: self.style.text.font(),
+                color: cx.theme().status().hint,
+                background_color: None,
+                underline: Default::default(),
+                strikethrough: None,
+            };
+            let runs = [commit_sha_run, info_run];
+
+            for row in display_row_range.start..display_row_range.end {
+                let start_y = row as f32 * line_height - scroll_top;
+                let start_x = layout.position_map.em_width * 2;
+
+                let origin = bounds.origin + point(start_x, start_y);
+
+                let font_size = self.style.text.font_size.to_pixels(cx.rem_size());
+                if let Some(line) = cx
+                    .text_system()
+                    .shape_line(blame_line.clone().into(), font_size, &runs)
+                    .log_err()
+                {
+                    line.paint(origin, line_height, cx).log_err();
+                }
+            }
         }
     }
 

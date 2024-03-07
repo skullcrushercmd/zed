@@ -443,6 +443,7 @@ struct BlameState {
 pub struct EditorSnapshot {
     pub mode: EditorMode,
     show_gutter: bool,
+    show_git_blame: bool,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_text: Option<Arc<str>>,
     is_focused: bool,
@@ -1707,6 +1708,7 @@ impl Editor {
         EditorSnapshot {
             mode: self.mode,
             show_gutter: self.show_gutter,
+            show_git_blame: self.blame.is_some(),
             display_snapshot: self.display_map.update(cx, |map, cx| map.snapshot(cx)),
             scroll_anchor: self.scroll_manager.anchor(),
             ongoing_scroll: self.scroll_manager.ongoing_scroll(),
@@ -9893,6 +9895,7 @@ impl EditorSnapshot {
             ProjectSettings::get_global(cx).git.git_gutter,
             Some(GitGutterSetting::TrackedFiles)
         );
+        let show_git_blame = self.show_git_blame;
         let gutter_settings = EditorSettings::get_global(cx).gutter;
 
         let line_gutter_width = if gutter_settings.line_numbers {
@@ -9903,7 +9906,9 @@ impl EditorSnapshot {
             0.0.into()
         };
 
-        let left_padding = if gutter_settings.code_actions {
+        let left_padding = if show_git_blame {
+            em_width * 50.0
+        } else if gutter_settings.code_actions {
             em_width * 3.0
         } else if show_git_gutter && gutter_settings.line_numbers {
             em_width * 2.0

@@ -1,5 +1,6 @@
 pub mod permalink;
 
+use core::fmt;
 use std::ops::Range;
 
 use git::{
@@ -105,26 +106,25 @@ pub enum DisplayBlameHunk {
     },
 }
 
-impl DisplayBlameHunk {
-    pub fn start_display_row(&self) -> u32 {
+impl fmt::Display for DisplayBlameHunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            &DisplayBlameHunk::Folded { display_row } => display_row,
-            DisplayBlameHunk::Unfolded {
-                display_row_range, ..
-            } => display_row_range.start,
+            DisplayBlameHunk::Folded { display_row } => Ok(()),
+            DisplayBlameHunk::Unfolded { blame_hunk, .. } => {
+                let datetime = blame_hunk.time.format("%Y-%m-%d %H:%M").to_string();
+
+                let pretty_commit_id = format!("{}", blame_hunk.oid);
+                let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
+
+                write!(
+                    f,
+                    "{} - {} - {}",
+                    short_commit_id,
+                    blame_hunk.name.as_deref().unwrap_or("<no name>"),
+                    datetime
+                )
+            }
         }
-    }
-
-    pub fn contains_display_row(&self, display_row: u32) -> bool {
-        let range = match self {
-            &DisplayBlameHunk::Folded { display_row } => display_row..=display_row,
-
-            DisplayBlameHunk::Unfolded {
-                display_row_range, ..
-            } => display_row_range.start..=display_row_range.end,
-        };
-
-        range.contains(&display_row)
     }
 }
 

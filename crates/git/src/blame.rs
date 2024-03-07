@@ -45,6 +45,13 @@ pub struct BlameHunk<T> {
     pub time: DateTime<FixedOffset>,
 }
 
+impl<T> BlameHunk<T> {
+    pub fn short_blame(&self) -> String {
+        let pretty_commit_id = format!("{}", self.oid);
+        pretty_commit_id.chars().take(6).collect::<String>()
+    }
+}
+
 impl BlameHunk<u32> {}
 
 impl sum_tree::Item for BlameHunk<Anchor> {
@@ -205,7 +212,7 @@ impl BufferBlame {
         };
 
         let oid = hunk.final_commit_id();
-        if oid == git2::Oid::zero() {
+        if oid.is_zero() {
             return Ok(None);
         }
 
