@@ -6,13 +6,14 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::iter;
 use std::process::{Command, Stdio};
+use std::str::SplitWhitespace;
 use std::{fmt, ops::Range, path::Path, sync::Arc};
 use sum_tree::SumTree;
 use text::{Anchor, Point};
 
 pub use git2 as libgit;
 
-const UNCOMMITTED_SHA: &'static str = "0000000000000000000000000000000000000000";
+const UNCOMMITTED_SHA: [u8; 20] = [0; 20];
 
 pub fn git_blame_incremental(
     working_directory: &Path,
@@ -52,7 +53,7 @@ pub fn git_blame_incremental(
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct BlameEntry {
-    pub sha: String,
+    pub sha: [u8; 20],
     pub original_line_number: u32,
     pub final_line_number: u32,
     pub line_count: u32,
@@ -90,33 +91,6 @@ impl BlameEntry {
             timezone,
         ))
     }
-
-    fn new_from_first_entry_line(parts: &[&str]) -> Result<BlameEntry> {
-        if let [sha, source_line_str, result_line_str, num_lines_str] = parts[..] {
-            let original_line_number = source_line_str
-                .parse::<u32>()
-                .map_err(|e| anyhow!("Failed to parse original line number: {}", e))?;
-            let final_line_number = result_line_str
-                .parse::<u32>()
-                .map_err(|e| anyhow!("Failed to parse final line number: {}", e))?;
-            let line_count = num_lines_str
-                .parse::<u32>()
-                .map_err(|e| anyhow!("Failed to parse line count: {}", e))?;
-
-            Ok(BlameEntry {
-                sha: sha.to_string(),
-                original_line_number,
-                final_line_number,
-                line_count,
-                ..Default::default()
-            })
-        } else {
-            Err(anyhow!(
-                "Failed to parse first 'git blame' entry line: {}",
-                parts.join(" ").to_string()
-            ))
-        }
-    }
 }
 
 // parse_git_blame parses the output of `git blame --incremental`, which returns
@@ -131,7 +105,7 @@ impl BlameEntry {
 //     filename <whitespace-quoted-filename-goes-here>
 //
 // Line numbers are 1-indexed.
-
+//
 // A `git blame --incremental` entry looks like this:
 //
 //    6ad46b5257ba16d12c5ca9f0d4900320959df7f4 2 2 1
@@ -157,20 +131,42 @@ impl BlameEntry {
 // More about `--incremental` output: https://mirrors.edge.kernel.org/pub/software/scm/git/docs/git-blame.html
 pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
     let mut entries: Vec<BlameEntry> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut index: HashMap<[u8; 20], usize> = HashMap::new();
 
     let mut current_entry: Option<BlameEntry> = None;
 
     for line in output.lines() {
-        let parts = line.split_whitespace().collect::<Vec<&str>>();
-        if parts.len() < 2 {
-            continue;
-        }
-
+        let mut parts = line.split_whitespace();
         let mut done = false;
         match &mut current_entry {
             None => {
-                let mut new_entry = BlameEntry::new_from_first_entry_line(&parts)?;
+                let sha = parts
+                    .next()
+                    .map(parse_commit_sha)
+                    .ok_or_else(|| anyhow!("failed to parse sha"))??;
+
+                let original_line_number =
+                    parts
+                        .next()
+                        .and_then(|line| line.parse::<u32>().ok())
+                        .ok_or_else(|| anyhow!("Failed to parse original line number"))?;
+                let final_line_number = parts
+                    .next()
+                    .and_then(|line| line.parse::<u32>().ok())
+                    .ok_or_else(|| anyhow!("Failed to parse final line number"))?;
+
+                let line_count = parts
+                    .next()
+                    .and_then(|line| line.parse::<u32>().ok())
+                    .ok_or_else(|| anyhow!("Failed to parse final line number"))?;
+
+                let mut new_entry = BlameEntry {
+                    sha,
+                    original_line_number,
+                    final_line_number,
+                    line_count,
+                    ..Default::default()
+                };
                 if let Some(existing_entry) = index
                     .get(&new_entry.sha)
                     .and_then(|slot| entries.get(*slot))
@@ -189,11 +185,11 @@ pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
                 current_entry.replace(new_entry);
             }
             Some(entry) => {
-                let Some(key) = parts.first() else {
+                let Some(key) = parts.next() else {
                     continue;
                 };
-                let value = parts[1..].join(" ").to_string();
-                match *key {
+                let value = parts.collect::<String>();
+                match key {
                     "filename" => {
                         entry.filename = value;
                         done = true;
@@ -229,13 +225,21 @@ pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
 
         if done {
             if let Some(entry) = current_entry.take() {
-                index.insert(entry.sha.clone(), entries.len());
+                index.insert(entry.sha, entries.len());
                 entries.push(entry);
             }
         }
     }
 
     Ok(entries)
+}
+
+fn parse_commit_sha(hex: &str) -> Result<[u8; 20]> {
+    let mut bytes = [0u8; 20];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16)?;
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,7 +335,7 @@ impl BufferBlame {
             let end = Point::new(start_line + entry.line_count, 0);
 
             let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
-            let oid = libgit::Oid::from_str(&entry.sha)?;
+            let oid = libgit::Oid::from_bytes(&entry.sha)?;
 
             let hunk = BlameHunk {
                 buffer_range,
@@ -410,7 +414,15 @@ impl BufferBlame {
 
 #[cfg(test)]
 mod tests {
+    use git2 as libgit;
+
     use std::path::PathBuf;
+
+    use text::Buffer;
+    use text::BufferId;
+    use text::Point;
+
+    use crate::blame::BlameHunk;
 
     use super::parse_git_blame;
     use super::BlameEntry;
@@ -464,5 +476,47 @@ mod tests {
         let output = read_test_data("blame_incremental_complex");
         let entries = parse_git_blame(&output).unwrap();
         assert_eq_golden(&entries, "blame_incremental_complex");
+    }
+
+    #[test]
+    fn test_benchmark_git_blame_editor_editor() {
+        let output = read_test_data("blame_incremental_editor_editor");
+
+        let buffer = Buffer::new(0, BufferId::new(1).unwrap(), String::new());
+
+        let now = std::time::Instant::now();
+        let mut entries = parse_git_blame(&output).unwrap();
+        entries.sort_by(|a, b| a.final_line_number.cmp(&b.final_line_number));
+
+        println!(
+            "parsing git blame output took: {:?}. entries: {}",
+            now.elapsed(),
+            entries.len()
+        );
+
+        let mut tree = sum_tree::SumTree::new();
+
+        let now = std::time::Instant::now();
+        for entry in entries {
+            let start_line = entry.final_line_number - 1;
+            let start = Point::new(start_line, 0);
+            let end = Point::new(start_line + entry.line_count, 0);
+
+            let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
+            let oid = libgit::Oid::from_bytes(&entry.sha).unwrap();
+
+            let hunk = BlameHunk {
+                buffer_range,
+                oid,
+                name: Some(entry.committer.clone()),
+                email: Some(entry.committer_mail.clone()),
+                time: entry.committer_datetime().expect("lol"),
+            };
+            tree.push(hunk, &buffer);
+        }
+        println!(
+            "git blame incremental. pushing to tree took: {:?}",
+            now.elapsed()
+        );
     }
 }
