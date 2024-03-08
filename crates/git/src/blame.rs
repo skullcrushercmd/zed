@@ -1,42 +1,242 @@
-use fs::repository::GitRepository;
+use anyhow::anyhow;
+use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset, NaiveDateTime};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::iter;
-
-use anyhow::Result;
-use anyhow::{anyhow, Context};
-
-use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
-use parking_lot::Mutex;
+use std::process::{Command, Stdio};
 use std::{fmt, ops::Range, path::Path, sync::Arc};
 use sum_tree::SumTree;
-use util::ResultExt;
-
 use text::{Anchor, Point};
 
 pub use git2 as libgit;
 
-use crate::blame_incremental::{git_blame_incremental, parse_git_blame};
+const UNCOMMITTED_SHA: &'static str = "0000000000000000000000000000000000000000";
 
-// DiffHunk is the data
-// DiffHunk<u32> has a `.status`
-// DiffHunk<Anchor> implements `sum_tree::Item`
-//   summary is `DiffHunkSummary` with `buffer_range: Range<Anchor>`
+pub fn git_blame_incremental(
+    working_directory: &Path,
+    path: &Path,
+    contents: &String,
+) -> Result<String> {
+    let mut child = Command::new("git")
+        .current_dir(working_directory)
+        .arg("blame")
+        // TODO: turn off all the git configurations
+        .arg("--incremental")
+        .arg("--contents")
+        .arg("-")
+        .arg(path.as_os_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to start git blame process: {}", e))?;
 
-// DiffHunkSummary implements `sum_tree::Summary`
-// when that gets added via `add_summary` with another summary
-// it expands its range.
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(contents.as_bytes())
+            .map_err(|e| anyhow!("Failed to write to git blame stdin: {}", e))?;
+    }
 
-// BufferDiff, `hunks_in_row_range` takes in a `Range<u32>`
-// converts the range to anchors
-// then sets `hunks_intersecting_range`, which takes in anchors
+    let output = child
+        .wait_with_output()
+        .map_err(|e| anyhow!("Failed to read git blame output: {}", e))?;
 
-// the real magic happens in `hunks_intersecting_range`
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("git blame process failed: {}", stderr));
+    }
 
-// - builds a cursor that only gives the hunks in the tree that are in the range
-// - then takes the hunks that cursor returns and turns them into pair of start/end
+    Ok(String::from_utf8(output.stdout)?)
+}
 
-// - it then calls `buffer.summaries_for_anchors_with_payload` to essentially convert
-// the `Anchor`s into `Point`s. The `payload` is the diff information.
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct BlameEntry {
+    pub sha: String,
+    pub original_line_number: u32,
+    pub final_line_number: u32,
+    pub line_count: u32,
+
+    pub author: String,
+    pub author_mail: String,
+    pub author_time: i64,
+    pub author_tz: String,
+
+    pub committer: String,
+    pub committer_mail: String,
+    pub committer_time: i64,
+    pub committer_tz: String,
+
+    pub summary: String,
+
+    pub previous: Option<String>,
+    pub filename: String,
+}
+
+impl BlameEntry {
+    pub fn committer_datetime(&self) -> Result<DateTime<FixedOffset>> {
+        let naive_datetime = NaiveDateTime::from_timestamp_opt(self.committer_time, 0)
+            .expect("failed to parse timestamp");
+        let timezone_offset_in_seconds = self
+            .committer_tz
+            .parse::<i32>()
+            .map_err(|e| anyhow!("Failed to parse timezone offset: {}", e))?
+            / 100
+            * 36;
+        let timezone = FixedOffset::east_opt(timezone_offset_in_seconds)
+            .ok_or_else(|| anyhow!("Invalid timezone offset: {}", self.committer_tz))?;
+        Ok(DateTime::<FixedOffset>::from_naive_utc_and_offset(
+            naive_datetime,
+            timezone,
+        ))
+    }
+
+    fn new_from_first_entry_line(parts: &[&str]) -> Result<BlameEntry> {
+        if let [sha, source_line_str, result_line_str, num_lines_str] = parts[..] {
+            let original_line_number = source_line_str
+                .parse::<u32>()
+                .map_err(|e| anyhow!("Failed to parse original line number: {}", e))?;
+            let final_line_number = result_line_str
+                .parse::<u32>()
+                .map_err(|e| anyhow!("Failed to parse final line number: {}", e))?;
+            let line_count = num_lines_str
+                .parse::<u32>()
+                .map_err(|e| anyhow!("Failed to parse line count: {}", e))?;
+
+            Ok(BlameEntry {
+                sha: sha.to_string(),
+                original_line_number,
+                final_line_number,
+                line_count,
+                ..Default::default()
+            })
+        } else {
+            Err(anyhow!(
+                "Failed to parse first 'git blame' entry line: {}",
+                parts.join(" ").to_string()
+            ))
+        }
+    }
+}
+
+// parse_git_blame parses the output of `git blame --incremental`, which returns
+// all the blame-entries for a given path incrementally, as it finds them.
+//
+// Each entry *always* starts with:
+//
+//     <40-byte-hex-sha1> <sourceline> <resultline> <num-lines>
+//
+// Each entry *always* ends with:
+//
+//     filename <whitespace-quoted-filename-goes-here>
+//
+// Line numbers are 1-indexed.
+
+// A `git blame --incremental` entry looks like this:
+//
+//    6ad46b5257ba16d12c5ca9f0d4900320959df7f4 2 2 1
+//    author Joe Schmoe
+//    author-mail <joe.schmoe@example.com>
+//    author-time 1709741400
+//    author-tz +0100
+//    committer Joe Schmoe
+//    committer-mail <joe.schmoe@example.com>
+//    committer-time 1709741400
+//    committer-tz +0100
+//    summary Joe's cool commit
+//    previous 486c2409237a2c627230589e567024a96751d475 index.js
+//    filename index.js
+//
+// If the entry has the same SHA as an entry that was already printed then no
+// signature information is printed:
+//
+//    6ad46b5257ba16d12c5ca9f0d4900320959df7f4 3 4 1
+//    previous 486c2409237a2c627230589e567024a96751d475 index.js
+//    filename index.js
+//
+// More about `--incremental` output: https://mirrors.edge.kernel.org/pub/software/scm/git/docs/git-blame.html
+pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
+    let mut entries: Vec<BlameEntry> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+
+    let mut current_entry: Option<BlameEntry> = None;
+
+    for line in output.lines() {
+        let parts = line.split_whitespace().collect::<Vec<&str>>();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let mut done = false;
+        match &mut current_entry {
+            None => {
+                let mut new_entry = BlameEntry::new_from_first_entry_line(&parts)?;
+                if let Some(existing_entry) = index
+                    .get(&new_entry.sha)
+                    .and_then(|slot| entries.get(*slot))
+                {
+                    new_entry.author = existing_entry.author.clone();
+                    new_entry.author_mail = existing_entry.author_mail.clone();
+                    new_entry.author_time = existing_entry.author_time;
+                    new_entry.author_tz = existing_entry.author_tz.clone();
+                    new_entry.committer = existing_entry.committer.clone();
+                    new_entry.committer_mail = existing_entry.committer_mail.clone();
+                    new_entry.committer_time = existing_entry.committer_time;
+                    new_entry.committer_tz = existing_entry.committer_tz.clone();
+                    new_entry.summary = existing_entry.summary.clone();
+                }
+
+                current_entry.replace(new_entry);
+            }
+            Some(entry) => {
+                let Some(key) = parts.first() else {
+                    continue;
+                };
+                let value = parts[1..].join(" ").to_string();
+                match *key {
+                    "filename" => {
+                        entry.filename = value;
+                        done = true;
+                    }
+                    "summary" => entry.summary = value,
+                    "previous" => entry.previous = Some(value),
+
+                    "author" => {
+                        entry.author = if entry.sha == UNCOMMITTED_SHA {
+                            "Not committed".to_string()
+                        } else {
+                            value
+                        }
+                    }
+                    "author-mail" => entry.author_mail = value,
+                    "author-time" => entry.author_time = value.parse::<i64>()?,
+                    "author-tz" => entry.author_tz = value,
+
+                    "committer" => {
+                        entry.committer = if entry.sha == UNCOMMITTED_SHA {
+                            "Not committed".to_string()
+                        } else {
+                            value
+                        }
+                    }
+                    "committer-mail" => entry.committer_mail = value,
+                    "committer-time" => entry.committer_time = value.parse::<i64>()?,
+                    "committer-tz" => entry.committer_tz = value,
+                    _ => {}
+                }
+            }
+        };
+
+        if done {
+            if let Some(entry) = current_entry.take() {
+                index.insert(entry.sha.clone(), entries.len());
+                entries.push(entry);
+            }
+        }
+    }
+
+    Ok(entries)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameHunk<T> {
@@ -46,19 +246,6 @@ pub struct BlameHunk<T> {
     pub name: Option<String>,
     pub email: Option<String>,
     pub time: DateTime<FixedOffset>,
-}
-
-struct Signature {
-    name: Option<String>,
-    email: Option<String>,
-    time: DateTime<FixedOffset>,
-}
-
-impl<T> BlameHunk<T> {
-    pub fn short_blame(&self) -> String {
-        let pretty_commit_id = format!("{}", self.oid);
-        pretty_commit_id.chars().take(6).collect::<String>()
-    }
 }
 
 impl BlameHunk<u32> {}
@@ -110,7 +297,6 @@ impl sum_tree::Summary for BlameHunkSummary {
 
 #[derive(Clone)]
 pub struct BufferBlame {
-    last_buffer_version: Option<clock::Global>,
     tree: SumTree<BlameHunk<Anchor>>,
 }
 
@@ -129,6 +315,7 @@ impl BufferBlame {
         let now = std::time::Instant::now();
         let mut entries = parse_git_blame(&output)?;
         entries.sort_by(|a, b| a.final_line_number.cmp(&b.final_line_number));
+
         println!(
             "parsing git blame output took: {:?}. entries: {}",
             now.elapsed(),
@@ -160,21 +347,7 @@ impl BufferBlame {
             now.elapsed()
         );
 
-        Ok(BufferBlame {
-            last_buffer_version: Some(buffer.version().clone()),
-            tree,
-        })
-    }
-
-    pub fn new() -> BufferBlame {
-        BufferBlame {
-            last_buffer_version: None,
-            tree: SumTree::new(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        Ok(BufferBlame { tree })
     }
 
     pub fn hunks_in_row_range<'a>(
@@ -233,111 +406,63 @@ impl BufferBlame {
             })
         })
     }
-
-    pub fn update(
-        &mut self,
-        repo: Arc<Mutex<dyn GitRepository>>,
-        path: &Path,
-        buffer: &text::BufferSnapshot,
-    ) -> Result<()> {
-        let repo = repo.lock();
-
-        println!("starting libgit:blame");
-        let start_time = std::time::Instant::now();
-        let blame = repo.blame_path(path)?;
-        let buffer_text = buffer.as_rope().to_string();
-        let blame_buffer = blame.blame_buffer(buffer_text.as_bytes())?;
-        println!(
-            "libgit::blame, execution time: {:?}. entries: {}",
-            start_time.elapsed(),
-            blame_buffer.len()
-        );
-
-        let mut tree = SumTree::new();
-        let mut signatures = HashMap::default();
-        for hunk_index in 0..blame_buffer.len() {
-            let hunk =
-                Self::process_blame_hunk(&blame_buffer, hunk_index, &buffer, &mut signatures)
-                    .log_err()
-                    .flatten();
-            if let Some(hunk) = hunk {
-                tree.push(hunk, buffer);
-            }
-        }
-
-        self.tree = tree;
-        self.last_buffer_version = Some(buffer.version().clone());
-
-        Ok(())
-    }
-
-    fn process_blame_hunk(
-        blame: &libgit::Blame<'_>,
-        hunk_index: usize,
-        buffer: &text::BufferSnapshot,
-        signatures: &mut HashMap<libgit::Oid, Signature>,
-    ) -> Result<Option<BlameHunk<Anchor>>> {
-        let Some(hunk) = blame.get_index(hunk_index) else {
-            return Ok(None);
-        };
-
-        let oid = hunk.final_commit_id();
-        if oid.is_zero() {
-            return Ok(None);
-        }
-
-        let line_count = hunk.lines_in_hunk();
-        if line_count == usize::MAX {
-            // TODO: not sure when this happens.
-            return Ok(None);
-        }
-
-        let line_count = line_count as u32;
-        let start_line = hunk.final_start_line() as u32 - 1;
-
-        let start = Point::new(start_line, 0);
-        let end = Point::new(start_line + line_count, 0);
-
-        println!("hunk. start: {}, end: {}", start.row, end.row);
-        let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
-
-        if let Some(signature) = signatures.get(&oid) {
-            Ok(Some(BlameHunk {
-                oid,
-                name: signature.name.clone(),
-                email: signature.email.clone(),
-                time: signature.time.clone(),
-                buffer_range,
-            }))
-        } else {
-            let final_signature = hunk.final_signature();
-            let name = final_signature.name().map(String::from);
-            let email = final_signature.email().map(String::from);
-            let when = hunk.final_signature().when();
-            let time = git_time_to_chrono(when)?;
-
-            let signature = Signature { name, email, time };
-            let blame_hunk = BlameHunk {
-                oid,
-                name: signature.name.clone(),
-                email: signature.email.clone(),
-                time: signature.time.clone(),
-                buffer_range,
-            };
-            signatures.insert(oid, signature);
-
-            Ok(Some(blame_hunk))
-        }
-    }
 }
 
-fn git_time_to_chrono(time: libgit::Time) -> Result<DateTime<FixedOffset>> {
-    let offset_seconds = time.offset_minutes() * 60; // convert minutes to seconds
-    let fixed_offset = FixedOffset::east_opt(offset_seconds)
-        .ok_or_else(|| anyhow!("failed to parse timezone in 'git blame' timestamp"))?;
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
 
-    match fixed_offset.timestamp_opt(time.seconds(), 0) {
-        LocalResult::Single(datetime) => Ok(datetime),
-        _ => Err(anyhow!("failed to parse 'git blame' timestamp")),
+    use super::parse_git_blame;
+    use super::BlameEntry;
+
+    fn read_test_data(filename: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test_data");
+        path.push(filename);
+
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("Could not read test data at {:?}. Is it generated?", path))
+    }
+
+    fn assert_eq_golden(entries: &Vec<BlameEntry>, golden_filename: &str) {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test_data");
+        path.push("golden");
+        path.push(format!("{}.json", golden_filename));
+
+        let have_json =
+            serde_json::to_string_pretty(&entries).expect("could not serialize entries to JSON");
+
+        let update = std::env::var("UPDATE_GOLDEN")
+            .map(|val| val.to_ascii_lowercase() == "true")
+            .unwrap_or(false);
+
+        if update {
+            std::fs::create_dir_all(path.parent().unwrap())
+                .expect("could not create golden test data directory");
+            std::fs::write(&path, have_json).expect("could not write out golden data");
+        } else {
+            let want_json =
+                std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                    panic!("could not read golden test data file at {:?}. Did you run the test with UPDATE_GOLDEN=true before?", path);
+                });
+
+            pretty_assertions::assert_eq!(have_json, want_json, "wrong blame entries");
+        }
+    }
+
+    #[test]
+    fn test_parse_git_blame_simple() {
+        let output = read_test_data("blame_incremental_simple");
+        let entries = parse_git_blame(&output).unwrap();
+        assert_eq_golden(&entries, "blame_incremental_simple");
+    }
+
+    #[test]
+    fn test_parse_git_blame_complex() {
+        // This testdata is the `git blame --incremental` output of `editor/src/editor.rs`:
+        let output = read_test_data("blame_incremental_complex");
+        let entries = parse_git_blame(&output).unwrap();
+        assert_eq_golden(&entries, "blame_incremental_complex");
     }
 }

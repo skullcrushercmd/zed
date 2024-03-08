@@ -4,7 +4,6 @@ pub use git2 as libgit;
 pub use lazy_static::lazy_static;
 
 pub mod blame;
-pub mod blame_incremental;
 pub mod diff;
 
 lazy_static! {
