@@ -217,7 +217,6 @@ impl GitRepository for LibGitRepository {
         let mut opts = git2::BlameOptions::default();
         let blame = self.blame_file(path, Some(&mut opts))?;
 
-        // let buffer_blame = blame.blame_buffer(buffer.as_bytes())?;
         Ok(blame)
     }
 }

@@ -162,6 +162,7 @@ impl BufferDiff {
     }
 
     pub async fn update(&mut self, diff_base: &str, buffer: &text::BufferSnapshot) {
+        println!("update git diff");
         let mut tree = SumTree::new();
 
         let buffer_text = buffer.as_rope().to_string();

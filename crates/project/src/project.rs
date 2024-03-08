@@ -7354,6 +7354,19 @@ impl Project {
         })
     }
 
+    pub fn get_workspace_root(
+        &self,
+        project_path: &ProjectPath,
+        cx: &AppContext,
+    ) -> Option<PathBuf> {
+        Some(
+            self.worktree_for_id(project_path.worktree_id, cx)?
+                .read(cx)
+                .abs_path()
+                .to_path_buf(),
+        )
+    }
+
     pub fn get_repo(
         &self,
         project_path: &ProjectPath,

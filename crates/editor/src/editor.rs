@@ -436,6 +436,7 @@ pub struct Editor {
     >,
 }
 
+// TODO: Make this a model
 struct BlameState {
     blame: BufferBlame,
     refresh_subscription: Subscription,
@@ -813,8 +814,7 @@ impl CompletionsMenu {
             return;
         }
         // this is newly inserted
-        // and this too?  
-
+        // and this too?
 
         let completion_index = self.matches[self.selected_item].candidate_id;
         let Some(project) = project else {
@@ -8775,16 +8775,20 @@ impl Editor {
         let buffer = self.buffer().read(cx).as_singleton()?;
         let file = buffer.read(cx).file()?.as_local()?.path();
 
-        let git_repo = project.get_repo(&buffer.read(cx).project_path(cx)?, cx)?;
+        let buffer_project_path = buffer.read(cx).project_path(cx)?;
+        let git_repo = project.get_repo(&buffer_project_path, cx)?;
+        let working_directory = project.get_workspace_root(&buffer_project_path, cx)?;
         let buffer_snapshot = buffer.read(cx).snapshot();
 
         let git_blame_generation = cx.background_executor().spawn({
             let file = file.clone();
-            let git_repo = git_repo.clone();
+            // let git_repo = git_repo.clone();
             async move {
-                let mut buffer_blame = BufferBlame::new();
-                buffer_blame.update(git_repo, &file, &buffer_snapshot)?;
-                Ok(buffer_blame)
+                let _buffer_blame =
+                    BufferBlame::new_with_cli(&working_directory, &file, &buffer_snapshot)?;
+                // let mut buffer_blame = BufferBlame::new();
+                // buffer_blame.update(git_repo, &file, &buffer_snapshot)?;
+                Ok(_buffer_blame)
             }
         });
 

@@ -2,8 +2,8 @@ use fs::repository::GitRepository;
 use std::collections::HashMap;
 use std::iter;
 
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::{anyhow, Context};
 
 use chrono::{DateTime, FixedOffset, LocalResult, TimeZone};
 use parking_lot::Mutex;
@@ -14,6 +14,8 @@ use util::ResultExt;
 use text::{Anchor, Point};
 
 pub use git2 as libgit;
+
+use crate::blame_incremental::{git_blame_incremental, parse_git_blame};
 
 // DiffHunk is the data
 // DiffHunk<u32> has a `.status`
@@ -113,13 +115,55 @@ pub struct BufferBlame {
 }
 
 impl BufferBlame {
-    pub fn new_with_cli(path: &Arc<Path>, buffer_contents: &String) -> BufferBlame {
-        println!("path: {}", path.display());
-        println!("buffer_contents: {}", buffer_contents);
-        BufferBlame {
-            last_buffer_version: None,
-            tree: SumTree::new(),
+    pub fn new_with_cli(
+        working_directory: &Path,
+        path: &Arc<Path>,
+        buffer: &text::BufferSnapshot,
+    ) -> Result<BufferBlame> {
+        let buffer_text = buffer.as_rope().to_string();
+        let now = std::time::Instant::now();
+        let output = git_blame_incremental(working_directory, path, &buffer_text)
+            .context("failed to run 'git blame'")?;
+        println!("running git blame took: {:?}", now.elapsed());
+
+        let now = std::time::Instant::now();
+        let mut entries = parse_git_blame(&output)?;
+        entries.sort_by(|a, b| a.final_line_number.cmp(&b.final_line_number));
+        println!(
+            "parsing git blame output took: {:?}. entries: {}",
+            now.elapsed(),
+            entries.len()
+        );
+
+        let mut tree = SumTree::new();
+
+        let now = std::time::Instant::now();
+        for entry in entries {
+            let start_line = entry.final_line_number - 1;
+            let start = Point::new(start_line, 0);
+            let end = Point::new(start_line + entry.line_count, 0);
+
+            let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
+            let oid = libgit::Oid::from_str(&entry.sha)?;
+
+            let hunk = BlameHunk {
+                buffer_range,
+                oid,
+                name: Some(entry.committer.clone()),
+                email: Some(entry.committer_mail.clone()),
+                time: entry.committer_datetime()?,
+            };
+            tree.push(hunk, buffer);
         }
+        println!(
+            "git blame incremental. pushing to tree took: {:?}",
+            now.elapsed()
+        );
+
+        Ok(BufferBlame {
+            last_buffer_version: Some(buffer.version().clone()),
+            tree,
+        })
     }
 
     pub fn new() -> BufferBlame {
@@ -198,26 +242,17 @@ impl BufferBlame {
     ) -> Result<()> {
         let repo = repo.lock();
 
+        println!("starting libgit:blame");
         let start_time = std::time::Instant::now();
         let blame = repo.blame_path(path)?;
         let buffer_text = buffer.as_rope().to_string();
         let blame_buffer = blame.blame_buffer(buffer_text.as_bytes())?;
-        println!("git blame, execution time: {:?}", start_time.elapsed());
+        println!(
+            "libgit::blame, execution time: {:?}. entries: {}",
+            start_time.elapsed(),
+            blame_buffer.len()
+        );
 
-        println!("using blame.get_line() api:");
-        for (line_idx, line) in buffer_text.lines().enumerate() {
-            if let Some(hunk) = blame_buffer.get_line(line_idx + 1) {
-                println!(
-                    "line: {}, oid: {}, start: {}, line count: {}",
-                    line_idx,
-                    hunk.final_commit_id(),
-                    hunk.final_start_line(),
-                    hunk.lines_in_hunk()
-                );
-            }
-        }
-
-        println!("iterating over hunks:");
         let mut tree = SumTree::new();
         let mut signatures = HashMap::default();
         for hunk_index in 0..blame_buffer.len() {
@@ -248,21 +283,7 @@ impl BufferBlame {
 
         let oid = hunk.final_commit_id();
         if oid.is_zero() {
-            println!(
-                "hunk: {}, zero commit, start: {}, line count: {}",
-                hunk_index,
-                hunk.final_start_line(),
-                hunk.lines_in_hunk()
-            );
             return Ok(None);
-        } else {
-            println!(
-                "hunk: {}, oid: {}, start: {}, line_count: {}",
-                hunk_index,
-                oid,
-                hunk.final_start_line(),
-                hunk.lines_in_hunk()
-            );
         }
 
         let line_count = hunk.lines_in_hunk();
@@ -277,7 +298,7 @@ impl BufferBlame {
         let start = Point::new(start_line, 0);
         let end = Point::new(start_line + line_count, 0);
 
-        // println!("{}, start: {}, end: {}", oid, start.row, end.row);
+        println!("hunk. start: {}, end: {}", start.row, end.row);
         let buffer_range = buffer.anchor_before(start)..buffer.anchor_before(end);
 
         if let Some(signature) = signatures.get(&oid) {

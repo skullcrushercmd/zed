@@ -109,20 +109,21 @@ pub enum DisplayBlameHunk {
 impl fmt::Display for DisplayBlameHunk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DisplayBlameHunk::Folded { display_row } => Ok(()),
+            DisplayBlameHunk::Folded { .. } => Ok(()),
             DisplayBlameHunk::Unfolded { blame_hunk, .. } => {
                 let datetime = blame_hunk.time.format("%Y-%m-%d %H:%M").to_string();
 
                 let pretty_commit_id = format!("{}", blame_hunk.oid);
                 let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
 
-                write!(
-                    f,
-                    "{} {} ({})",
-                    short_commit_id,
-                    blame_hunk.name.as_deref().unwrap_or("<no name>"),
-                    datetime
-                )
+                let name = blame_hunk.name.as_deref().unwrap_or("<no name>");
+                let name = if name.len() > 20 {
+                    format!("{}...", &name[..16])
+                } else {
+                    name.to_string()
+                };
+
+                write!(f, "{:6} {:20} ({})", short_commit_id, name, datetime)
             }
         }
     }
