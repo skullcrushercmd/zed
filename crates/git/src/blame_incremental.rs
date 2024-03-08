@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
@@ -46,7 +47,7 @@ pub fn git_blame_incremental(
     Ok(String::from_utf8(output.stdout)?)
 }
 
-#[derive(Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug)]
 pub struct BlameEntry {
     pub sha: String,
     pub original_line_number: u32,
@@ -199,7 +200,7 @@ pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
 
                     "author" => {
                         entry.author = if entry.sha == UNCOMMITTED_SHA {
-                            "Not commited".to_string()
+                            "Not committed".to_string()
                         } else {
                             value
                         }
@@ -210,7 +211,7 @@ pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
 
                     "committer" => {
                         entry.committer = if entry.sha == UNCOMMITTED_SHA {
-                            "Not commited".to_string()
+                            "Not committed".to_string()
                         } else {
                             value
                         }
@@ -236,219 +237,60 @@ pub fn parse_git_blame(output: &str) -> Result<Vec<BlameEntry>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::blame_incremental::{parse_git_blame, UNCOMMITTED_SHA};
+    use std::path::PathBuf;
 
-    macro_rules! assert_author_commiter {
-        ($entry:expr, $author:expr, $mail:expr, $time:expr, $tz:expr) => {
-            assert_eq!($entry.author, $author);
-            assert_eq!($entry.author_mail, $mail);
-            assert_eq!($entry.author_time, $time);
-            assert_eq!($entry.author_tz, $tz);
-            assert_eq!($entry.committer, $author);
-            assert_eq!($entry.committer_mail, $mail);
-            assert_eq!($entry.committer_time, $time);
-            assert_eq!($entry.committer_tz, $tz);
-        };
+    use crate::blame_incremental::parse_git_blame;
+
+    use super::BlameEntry;
+
+    fn read_test_data(filename: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test_data");
+        path.push(filename);
+
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("Could not read test data at {:?}. Is it generated?", path))
     }
 
-    macro_rules! assert_uncommitted {
-        ($entry:expr, $time:expr, $tz:expr) => {
-            assert_eq!($entry.author, "Not Committed Yet");
-            assert_eq!($entry.author_mail, "<not.committed.yet>");
-            assert_eq!($entry.author_time, $time);
-            assert_eq!($entry.author_tz, $tz);
-            assert_eq!($entry.committer, "Not Committed Yet");
-            assert_eq!($entry.committer_mail, "<not.committed.yet>");
-            assert_eq!($entry.committer_time, $time);
-            assert_eq!($entry.committer_tz, $tz);
-        };
+    fn assert_eq_golden(entries: &Vec<BlameEntry>, golden_filename: &str) {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test_data");
+        path.push("golden");
+        path.push(format!("{}.json", golden_filename));
+
+        let have_json =
+            serde_json::to_string_pretty(&entries).expect("could not serialize entries to JSON");
+
+        let update = std::env::var("UPDATE_GOLDEN")
+            .map(|val| val.to_ascii_lowercase() == "true")
+            .unwrap_or(false);
+
+        if update {
+            std::fs::create_dir_all(path.parent().unwrap())
+                .expect("could not create golden test data directory");
+            std::fs::write(&path, have_json).expect("could not write out golden data");
+        } else {
+            let want_json =
+                std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                    panic!("could not read golden test data file at {:?}. Did you run the test with UPDATE_GOLDEN=true before?", path);
+                });
+
+            pretty_assertions::assert_eq!(have_json, want_json, "wrong blame entries");
+        }
     }
 
     #[test]
-    fn test_parse_incremental_output() {
-        let output = r#"
-0000000000000000000000000000000000000000 3 3 1
-author Not Committed Yet
-author-mail <not.committed.yet>
-author-time 1709895274
-author-tz +0100
-committer Not Committed Yet
-committer-mail <not.committed.yet>
-committer-time 1709895274
-committer-tz +0100
-summary Version of index.js from index.js
-previous a7037b4567dd171bfe563c761354ec9236c803b3 index.js
-filename index.js
-0000000000000000000000000000000000000000 7 7 2
-previous a7037b4567dd171bfe563c761354ec9236c803b3 index.js
-filename index.js
-c8d34ae30c87e59aaa5eb65f6c64d6206f525d7c 7 6 1
-author Thorsten Ball
-author-mail <mrnugget@example.com>
-author-time 1709808710
-author-tz +0100
-committer Thorsten Ball
-committer-mail <mrnugget@example.com>
-committer-time 1709808710
-committer-tz +0100
-summary Make a commit
-previous 6ad46b5257ba16d12c5ca9f0d4900320959df7f4 index.js
-filename index.js
-6ad46b5257ba16d12c5ca9f0d4900320959df7f4 2 2 1
-author Joe Schmoe
-author-mail <joe.schmoe@example.com>
-author-time 1709741400
-author-tz +0100
-committer Joe Schmoe
-committer-mail <joe.schmoe@example.com>
-committer-time 1709741400
-committer-tz +0100
-summary Joe's cool commit
-previous 486c2409237a2c627230589e567024a96751d475 index.js
-filename index.js
-6ad46b5257ba16d12c5ca9f0d4900320959df7f4 3 4 1
-previous 486c2409237a2c627230589e567024a96751d475 index.js
-filename index.js
-6ad46b5257ba16d12c5ca9f0d4900320959df7f4 13 9 1
-previous 486c2409237a2c627230589e567024a96751d475 index.js
-filename index.js
-486c2409237a2c627230589e567024a96751d475 3 1 1
-author Thorsten Ball
-author-mail <mrnugget@example.com>
-author-time 1709129122
-author-tz +0100
-committer Thorsten Ball
-committer-mail <mrnugget@example.com>
-committer-time 1709129122
-committer-tz +0100
-summary Get to a state where eslint would change code and imports
-previous 504065e448b467e79920040f22153e9d2ea0fd6e index.js
-filename index.js
-504065e448b467e79920040f22153e9d2ea0fd6e 3 5 1
-author Thorsten Ball
-author-mail <mrnugget@example.com>
-author-time 1709128963
-author-tz +0100
-committer Thorsten Ball
-committer-mail <mrnugget@example.com>
-committer-time 1709128963
-committer-tz +0100
-summary Add some stuff
-filename index.js
-504065e448b467e79920040f22153e9d2ea0fd6e 21 10 1
-filename index.js
-"#;
-
+    fn test_parse_git_blame_simple() {
+        let output = read_test_data("blame_incremental_simple");
         let entries = parse_git_blame(&output).unwrap();
-        assert_eq!(entries.len(), 9);
+        assert_eq_golden(&entries, "blame_incremental_simple");
+    }
 
-        assert_eq!(entries[0].sha, UNCOMMITTED_SHA);
-        assert_eq!(entries[0].original_line_number, 3);
-        assert_eq!(entries[0].final_line_number, 3);
-        assert_eq!(entries[0].line_count, 1);
-        assert_eq!(entries[0].filename, "index.js");
-        assert_eq!(entries[0].summary, "Version of index.js from index.js");
-        assert_eq!(
-            entries[0].previous,
-            Some("a7037b4567dd171bfe563c761354ec9236c803b3 index.js".to_owned())
-        );
-        assert_uncommitted!(entries[0], 1709895274, "+0100");
-
-        assert_eq!(entries[1].sha, UNCOMMITTED_SHA);
-        assert_eq!(entries[1].original_line_number, 7);
-        assert_eq!(entries[1].final_line_number, 7);
-        assert_eq!(entries[1].line_count, 2);
-        assert_eq!(entries[1].filename, "index.js");
-        assert_eq!(entries[1].summary, "Version of index.js from index.js");
-        assert_eq!(
-            entries[1].previous,
-            Some("a7037b4567dd171bfe563c761354ec9236c803b3 index.js".to_owned())
-        );
-        assert_uncommitted!(entries[1], 1709895274, "+0100");
-
-        assert_eq!(entries[2].sha, "c8d34ae30c87e59aaa5eb65f6c64d6206f525d7c");
-        assert_eq!(entries[2].original_line_number, 7);
-        assert_eq!(entries[2].final_line_number, 6);
-        assert_eq!(entries[2].line_count, 1);
-        assert_eq!(entries[2].filename, "index.js");
-        assert_eq!(entries[2].summary, "Make a commit");
-        assert_eq!(
-            entries[2].previous,
-            Some("6ad46b5257ba16d12c5ca9f0d4900320959df7f4 index.js".to_owned())
-        );
-        assert_author_commiter!(
-            entries[2],
-            "Thorsten Ball",
-            "<mrnugget@example.com>",
-            1709808710,
-            "+0100"
-        );
-
-        assert_eq!(entries[3].sha, "6ad46b5257ba16d12c5ca9f0d4900320959df7f4");
-        assert_eq!(entries[3].original_line_number, 2);
-        assert_eq!(entries[3].final_line_number, 2);
-        assert_eq!(entries[3].line_count, 1);
-        assert_eq!(entries[3].filename, "index.js");
-        assert_eq!(entries[3].summary, "Joe's cool commit");
-        assert_eq!(
-            entries[3].previous,
-            Some("486c2409237a2c627230589e567024a96751d475 index.js".to_owned())
-        );
-        assert_author_commiter!(
-            entries[3],
-            "Joe Schmoe",
-            "<joe.schmoe@example.com>",
-            1709741400,
-            "+0100"
-        );
-
-        assert_eq!(entries[4].sha, "6ad46b5257ba16d12c5ca9f0d4900320959df7f4");
-        assert_eq!(entries[4].original_line_number, 3);
-        assert_eq!(entries[4].final_line_number, 4);
-        assert_eq!(entries[4].line_count, 1);
-        assert_eq!(
-            entries[4].previous,
-            Some("486c2409237a2c627230589e567024a96751d475 index.js".to_owned())
-        );
-        assert_eq!(entries[5].sha, "6ad46b5257ba16d12c5ca9f0d4900320959df7f4");
-        assert_eq!(entries[5].original_line_number, 13);
-        assert_eq!(entries[5].final_line_number, 9);
-        assert_eq!(entries[5].line_count, 1);
-        assert_eq!(
-            entries[5].previous,
-            Some("486c2409237a2c627230589e567024a96751d475 index.js".to_owned())
-        );
-
-        assert_eq!(entries[6].sha, "486c2409237a2c627230589e567024a96751d475");
-        assert_eq!(entries[6].original_line_number, 3);
-        assert_eq!(entries[6].final_line_number, 1);
-        assert_eq!(entries[6].line_count, 1);
-        assert_eq!(
-            entries[6].previous,
-            Some("504065e448b467e79920040f22153e9d2ea0fd6e index.js".to_owned())
-        );
-        assert_author_commiter!(
-            entries[6],
-            "Thorsten Ball",
-            "<mrnugget@example.com>",
-            1709129122,
-            "+0100"
-        );
-
-        assert_eq!(entries[7].sha, "504065e448b467e79920040f22153e9d2ea0fd6e");
-        assert_eq!(entries[7].original_line_number, 3);
-        assert_eq!(entries[7].final_line_number, 5);
-        assert_eq!(entries[7].line_count, 1);
-        assert_author_commiter!(
-            entries[7],
-            "Thorsten Ball",
-            "<mrnugget@example.com>",
-            1709128963,
-            "+0100"
-        );
-        assert_eq!(entries[8].sha, "504065e448b467e79920040f22153e9d2ea0fd6e");
-        assert_eq!(entries[8].original_line_number, 21);
-        assert_eq!(entries[8].final_line_number, 10);
-        assert_eq!(entries[8].line_count, 1);
+    #[test]
+    fn test_parse_git_blame_complex() {
+        // This testdata is the `git blame --incremental` output of `editor/src/editor.rs`:
+        let output = read_test_data("blame_incremental_complex");
+        let entries = parse_git_blame(&output).unwrap();
+        assert_eq_golden(&entries, "blame_incremental_complex");
     }
 }
