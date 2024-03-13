@@ -3,7 +3,7 @@ mod anchor;
 pub use anchor::{Anchor, AnchorRangeExt};
 use anyhow::{anyhow, Result};
 use clock::ReplicaId;
-use collections::{BTreeMap, Bound, HashMap, HashSet};
+use collections::{BTreeMap, BTreeSet, Bound, HashMap, HashSet};
 use futures::{channel::mpsc, SinkExt};
 use git::diff::DiffHunk;
 use gpui::{AppContext, EventEmitter, Model, ModelContext};
@@ -2822,7 +2822,7 @@ impl MultiBufferSnapshot {
     pub fn can_resolve(&self, anchor: &Anchor) -> bool {
         if anchor.excerpt_id == ExcerptId::min() || anchor.excerpt_id == ExcerptId::max() {
             true
-        } else if let Some(excerpt) = self.excerpt(anchor.excerpt_id) {
+        } else if let Some(excerpt) = self.excerpt_for_id(anchor.excerpt_id) {
             excerpt.buffer.can_resolve(&anchor.text_anchor)
         } else {
             false
@@ -3332,7 +3332,7 @@ impl MultiBufferSnapshot {
     ) -> Option<(BufferId, Vec<OutlineItem<Anchor>>)> {
         let anchor = self.anchor_before(offset);
         let excerpt_id = anchor.excerpt_id;
-        let excerpt = self.excerpt(excerpt_id)?;
+        let excerpt = self.excerpt_for_id(excerpt_id)?;
         Some((
             excerpt.buffer_id,
             excerpt
@@ -3371,15 +3371,37 @@ impl MultiBufferSnapshot {
         }
     }
 
+    fn excerpt_locators_for_ids(
+        &self,
+        ids: impl IntoIterator<Item = ExcerptId>,
+    ) -> impl Iterator<Item = &Locator> {
+        let mut cursor = self.excerpt_ids.cursor::<ExcerptId>();
+        ids.into_iter().map(move |id| {
+            if id == ExcerptId::min() {
+                Locator::min_ref()
+            } else if id == ExcerptId::max() {
+                Locator::max_ref()
+            } else {
+                cursor.seek_forward(&id, Bias::Left, &());
+                if let Some(entry) = cursor.item() {
+                    if entry.id == id {
+                        return &entry.locator;
+                    }
+                }
+                panic!("invalid excerpt id {:?}", id)
+            }
+        })
+    }
+
     pub fn buffer_id_for_excerpt(&self, excerpt_id: ExcerptId) -> Option<BufferId> {
-        Some(self.excerpt(excerpt_id)?.buffer_id)
+        Some(self.excerpt_for_id(excerpt_id)?.buffer_id)
     }
 
     pub fn buffer_for_excerpt(&self, excerpt_id: ExcerptId) -> Option<&BufferSnapshot> {
-        Some(&self.excerpt(excerpt_id)?.buffer)
+        Some(&self.excerpt_for_id(excerpt_id)?.buffer)
     }
 
-    fn excerpt(&self, excerpt_id: ExcerptId) -> Option<&Excerpt> {
+    fn excerpt_for_id(&self, excerpt_id: ExcerptId) -> Option<&Excerpt> {
         let mut cursor = self.excerpts.cursor::<Option<&Locator>>();
         let locator = self.excerpt_locator_for_id(excerpt_id);
         cursor.seek(&Some(locator), Bias::Left, &());
@@ -3389,6 +3411,24 @@ impl MultiBufferSnapshot {
             }
         }
         None
+    }
+
+    /// Mutates the given set of excerpt ids to contain only ids of excerpts that have been deleted.
+    pub fn find_deleted_excerpts(&self, excerpt_ids: &mut BTreeSet<ExcerptId>) {
+        let mut excerpt_locators = self
+            .excerpt_locators_for_ids(excerpt_ids.iter().copied())
+            .collect::<Vec<_>>();
+        excerpt_locators.sort_unstable();
+
+        let mut cursor = self.excerpts.cursor::<Option<&Locator>>();
+        for locator in excerpt_locators {
+            cursor.seek_forward(&Some(locator), Bias::Left, &());
+            if let Some(excerpt) = cursor.item() {
+                if excerpt.locator == *locator {
+                    excerpt_ids.remove(&excerpt.id);
+                }
+            }
+        }
     }
 
     /// Returns the excerpt containing range and its offset start within the multibuffer or none if `range` spans multiple excerpts
@@ -5141,7 +5181,7 @@ mod tests {
                             continue;
                         }
 
-                        let excerpt = multibuffer.excerpt(anchor.excerpt_id).unwrap();
+                        let excerpt = multibuffer.excerpt_for_id(anchor.excerpt_id).unwrap();
                         assert_eq!(excerpt.id, anchor.excerpt_id);
                         assert!(excerpt.contains(anchor));
                     }

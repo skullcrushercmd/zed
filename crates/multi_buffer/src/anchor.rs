@@ -36,7 +36,7 @@ impl Anchor {
         if excerpt_id_cmp.is_eq() {
             if self.excerpt_id == ExcerptId::min() || self.excerpt_id == ExcerptId::max() {
                 Ordering::Equal
-            } else if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
+            } else if let Some(excerpt) = snapshot.excerpt_for_id(self.excerpt_id) {
                 self.text_anchor.cmp(&other.text_anchor, &excerpt.buffer)
             } else {
                 Ordering::Equal
@@ -52,7 +52,7 @@ impl Anchor {
 
     pub fn bias_left(&self, snapshot: &MultiBufferSnapshot) -> Anchor {
         if self.text_anchor.bias != Bias::Left {
-            if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
+            if let Some(excerpt) = snapshot.excerpt_for_id(self.excerpt_id) {
                 return Self {
                     buffer_id: self.buffer_id,
                     excerpt_id: self.excerpt_id,
@@ -65,7 +65,7 @@ impl Anchor {
 
     pub fn bias_right(&self, snapshot: &MultiBufferSnapshot) -> Anchor {
         if self.text_anchor.bias != Bias::Right {
-            if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
+            if let Some(excerpt) = snapshot.excerpt_for_id(self.excerpt_id) {
                 return Self {
                     buffer_id: self.buffer_id,
                     excerpt_id: self.excerpt_id,
@@ -86,7 +86,7 @@ impl Anchor {
     pub fn is_valid(&self, snapshot: &MultiBufferSnapshot) -> bool {
         if *self == Anchor::min() || *self == Anchor::max() {
             true
-        } else if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
+        } else if let Some(excerpt) = snapshot.excerpt_for_id(self.excerpt_id) {
             excerpt.contains(self)
                 && (self.text_anchor == excerpt.range.context.start
                     || self.text_anchor == excerpt.range.context.end

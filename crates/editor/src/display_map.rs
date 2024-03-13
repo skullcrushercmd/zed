@@ -133,7 +133,7 @@ impl DisplayMap {
         let (wrap_snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(tab_snapshot.clone(), edits, cx));
-        let block_snapshot = self.block_map.read(wrap_snapshot.clone(), edits);
+        let block_snapshot = self.block_map.snapshot(wrap_snapshot.clone(), edits);
 
         DisplaySnapshot {
             buffer_snapshot: self.buffer.read(cx).snapshot(cx),
@@ -171,13 +171,13 @@ impl DisplayMap {
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
         let (snapshot, edits) = fold_map.fold(ranges);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
     }
 
     pub fn unfold<T: ToOffset>(
@@ -195,13 +195,13 @@ impl DisplayMap {
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
         let (snapshot, edits) = fold_map.unfold(ranges, inclusive);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
     }
 
     pub fn insert_blocks(
@@ -310,7 +310,7 @@ impl DisplayMap {
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
 
         let (snapshot, edits) = self.inlay_map.splice(to_remove, to_insert);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
@@ -318,7 +318,7 @@ impl DisplayMap {
         let (snapshot, edits) = self
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits);
+        self.block_map.snapshot(snapshot, edits);
     }
 
     fn tab_size(buffer: &Model<MultiBuffer>, cx: &mut ModelContext<Self>) -> NonZeroU32 {

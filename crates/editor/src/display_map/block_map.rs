@@ -3,13 +3,12 @@ use super::{
     Highlights,
 };
 use crate::{EditorStyle, GutterDimensions};
-use collections::{Bound, HashMap, HashSet};
+use collections::{BTreeSet, Bound, HashMap, HashSet};
 use gpui::{AnyElement, ElementContext, Pixels};
 use language::{BufferSnapshot, Chunk, Patch, Point};
 use multi_buffer::{Anchor, ExcerptId, ExcerptRange, ToPoint as _};
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
     cmp::{self, Ordering},
     fmt::Debug,
     ops::{Deref, DerefMut, Range},
@@ -28,9 +27,9 @@ const NEWLINES: &[u8] = &[b'\n'; u8::MAX as usize];
 /// See the [`display_map` module documentation](crate::display_map) for more information.
 pub struct BlockMap {
     next_block_id: AtomicUsize,
-    wrap_snapshot: RefCell<WrapSnapshot>,
+    wrap_snapshot: WrapSnapshot,
     blocks: Vec<Arc<Block>>,
-    transforms: RefCell<SumTree<Transform>>,
+    transforms: SumTree<Transform>,
     buffer_header_height: u8,
     excerpt_header_height: u8,
 }
@@ -177,16 +176,16 @@ impl BlockMap {
         excerpt_header_height: u8,
     ) -> Self {
         let row_count = wrap_snapshot.max_point().row() + 1;
-        let map = Self {
+        let mut map = Self {
             next_block_id: AtomicUsize::new(0),
             blocks: Vec::new(),
-            transforms: RefCell::new(SumTree::from_item(Transform::isomorphic(row_count), &())),
-            wrap_snapshot: RefCell::new(wrap_snapshot.clone()),
+            transforms: SumTree::from_item(Transform::isomorphic(row_count), &()),
+            wrap_snapshot: wrap_snapshot.clone(),
             buffer_header_height,
             excerpt_header_height,
         };
         map.sync(
-            &wrap_snapshot,
+            wrap_snapshot,
             Patch::new(vec![Edit {
                 old: 0..row_count,
                 new: 0..row_count,
@@ -195,29 +194,26 @@ impl BlockMap {
         map
     }
 
-    pub fn read(&self, wrap_snapshot: WrapSnapshot, edits: Patch<u32>) -> BlockSnapshot {
-        self.sync(&wrap_snapshot, edits);
-        *self.wrap_snapshot.borrow_mut() = wrap_snapshot.clone();
+    pub fn snapshot(&mut self, wrap_snapshot: WrapSnapshot, edits: Patch<u32>) -> BlockSnapshot {
+        self.sync(wrap_snapshot.clone(), edits);
         BlockSnapshot {
             wrap_snapshot,
-            transforms: self.transforms.borrow().clone(),
+            transforms: self.transforms.clone(),
         }
     }
 
     pub fn write(&mut self, wrap_snapshot: WrapSnapshot, edits: Patch<u32>) -> BlockMapWriter {
-        self.sync(&wrap_snapshot, edits);
-        *self.wrap_snapshot.borrow_mut() = wrap_snapshot;
+        self.sync(wrap_snapshot, edits);
         BlockMapWriter(self)
     }
 
-    fn sync(&self, wrap_snapshot: &WrapSnapshot, mut edits: Patch<u32>) {
+    fn sync(&mut self, wrap_snapshot: WrapSnapshot, mut edits: Patch<u32>) {
         let buffer = wrap_snapshot.buffer_snapshot();
 
         // Handle changing the last excerpt if it is empty.
         if buffer.trailing_excerpt_update_count()
             != self
                 .wrap_snapshot
-                .borrow()
                 .buffer_snapshot()
                 .trailing_excerpt_update_count()
         {
@@ -230,21 +226,21 @@ impl BlockMap {
             }]);
         }
 
-        let edits = edits.into_inner();
+        let mut edits = edits.into_inner();
         if edits.is_empty() {
             return;
         }
 
-        let mut transforms = self.transforms.borrow_mut();
         let mut new_transforms = SumTree::new();
-        let old_row_count = transforms.summary().input_rows;
+        let old_row_count = self.transforms.summary().input_rows;
         let new_row_count = wrap_snapshot.max_point().row() + 1;
-        let mut cursor = transforms.cursor::<WrapRow>();
+        let mut cursor = self.transforms.cursor::<WrapRow>();
         let mut last_block_ix = 0;
         let mut blocks_in_edit = Vec::new();
-        let mut edits = edits.into_iter().peekable();
+        let mut touched_excerpts = BTreeSet::new();
+        let mut edits_iter = edits.iter().peekable();
 
-        while let Some(edit) = edits.next() {
+        while let Some(edit) = edits_iter.next() {
             // Preserve any old transforms that precede this edit.
             let old_start = WrapRow(edit.old.start);
             let new_start = WrapRow(edit.new.start);
@@ -292,7 +288,7 @@ impl BlockMap {
             }
 
             // Combine this edit with any subsequent edits that intersect the same transform.
-            while let Some(next_edit) = edits.peek() {
+            while let Some(next_edit) = edits_iter.peek() {
                 if next_edit.old.start <= cursor.start().0 {
                     old_end = WrapRow(next_edit.old.end);
                     new_end = WrapRow(next_edit.new.end);
@@ -311,7 +307,7 @@ impl BlockMap {
                             }
                         }
                     }
-                    edits.next();
+                    edits_iter.next();
                 } else {
                     break;
                 }
@@ -356,6 +352,7 @@ impl BlockMap {
                 self.blocks[start_block_ix..end_block_ix]
                     .iter()
                     .map(|block| {
+                        touched_excerpts.insert(block.position.excerpt_id);
                         let mut position = block.position.to_point(buffer);
                         match block.disposition {
                             BlockDisposition::Above => position.column = 0,
@@ -437,7 +434,21 @@ impl BlockMap {
         );
 
         drop(cursor);
-        *transforms = new_transforms;
+        self.wrap_snapshot = wrap_snapshot.clone();
+        self.transforms = new_transforms;
+
+        // Remove any block referencing deleted excerpts and sync again if needed.
+        // When syncing again, change each edit's old range to its new range since the underlying buffer didn't change.
+        buffer.find_deleted_excerpts(&mut touched_excerpts);
+        if !touched_excerpts.is_empty() {
+            self.blocks
+                .retain(|block| !touched_excerpts.contains(&block.position.excerpt_id));
+
+            for edit in &mut edits {
+                edit.old = edit.new.clone();
+            }
+            self.sync(wrap_snapshot, Patch::new(edits))
+        }
     }
 
     pub fn replace(&mut self, mut renderers: HashMap<BlockId, RenderBlock>) {
@@ -497,7 +508,7 @@ impl<'a> BlockMapWriter<'a> {
     ) -> Vec<BlockId> {
         let mut ids = Vec::new();
         let mut edits = Patch::default();
-        let wrap_snapshot = &*self.0.wrap_snapshot.borrow();
+        let wrap_snapshot = self.0.wrap_snapshot.clone();
         let buffer = wrap_snapshot.buffer_snapshot();
 
         for block in blocks {
@@ -544,7 +555,7 @@ impl<'a> BlockMapWriter<'a> {
     }
 
     pub fn remove(&mut self, block_ids: HashSet<BlockId>) {
-        let wrap_snapshot = &*self.0.wrap_snapshot.borrow();
+        let wrap_snapshot = self.0.wrap_snapshot.clone();
         let buffer = wrap_snapshot.buffer_snapshot();
         let mut edits = Patch::default();
         let mut last_block_buffer_row = None;
@@ -1059,7 +1070,7 @@ mod tests {
             },
         ]);
 
-        let snapshot = block_map.read(wraps_snapshot, Default::default());
+        let snapshot = block_map.snapshot(wraps_snapshot, Default::default());
         assert_eq!(snapshot.text(), "aaa\n\n\n\nbbb\nccc\nddd\n\n\n");
 
         let blocks = snapshot
@@ -1181,7 +1192,7 @@ mod tests {
         let (wraps_snapshot, wrap_edits) = wrap_map.update(cx, |wrap_map, cx| {
             wrap_map.sync(tab_snapshot, tab_edits, cx)
         });
-        let snapshot = block_map.read(wraps_snapshot, wrap_edits);
+        let snapshot = block_map.snapshot(wraps_snapshot, wrap_edits);
         assert_eq!(snapshot.text(), "aaa\n\nb!!!\n\n\nbb\nccc\nddd\n\n\n");
     }
 
@@ -1223,7 +1234,7 @@ mod tests {
 
         // Blocks with an 'above' disposition go above their corresponding buffer line.
         // Blocks with a 'below' disposition go below their corresponding buffer line.
-        let snapshot = block_map.read(wraps_snapshot, Default::default());
+        let snapshot = block_map.snapshot(wraps_snapshot, Default::default());
         assert_eq!(
             snapshot.text(),
             "one two \nthree\n\nfour five \nsix\n\nseven \neight"
@@ -1370,7 +1381,7 @@ mod tests {
             let (wraps_snapshot, wrap_edits) = wrap_map.update(cx, |wrap_map, cx| {
                 wrap_map.sync(tab_snapshot, tab_edits, cx)
             });
-            let blocks_snapshot = block_map.read(wraps_snapshot.clone(), wrap_edits);
+            let blocks_snapshot = block_map.snapshot(wraps_snapshot.clone(), wrap_edits);
             assert_eq!(
                 blocks_snapshot.transforms.summary().input_rows,
                 wraps_snapshot.max_point().row() + 1
