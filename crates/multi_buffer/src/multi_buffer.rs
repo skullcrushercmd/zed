@@ -301,7 +301,7 @@ impl MultiBuffer {
                     excerpts: buffer_state.excerpts.clone(),
                     _subscriptions: [
                         new_cx.observe(&buffer_state.buffer, |_, _, cx| cx.notify()),
-                        new_cx.subscribe(&buffer_state.buffer, Self::on_buffer_event),
+                        new_cx.subscribe(&buffer_state.buffer, Self::handle_buffer_event),
                     ],
                 },
             );
@@ -359,15 +359,7 @@ impl MultiBuffer {
 
     pub fn as_singleton(&self) -> Option<Model<Buffer>> {
         if self.singleton {
-            return Some(
-                self.buffers
-                    .borrow()
-                    .values()
-                    .next()
-                    .unwrap()
-                    .buffer
-                    .clone(),
-            );
+            return Some(self.buffers.borrow().values().next()?.buffer.clone());
         } else {
             None
         }
@@ -1080,7 +1072,7 @@ impl MultiBuffer {
             excerpts: Default::default(),
             _subscriptions: [
                 cx.observe(&buffer, |_, _, cx| cx.notify()),
-                cx.subscribe(&buffer, Self::on_buffer_event),
+                cx.subscribe(&buffer, Self::handle_buffer_event),
             ],
             buffer: buffer.clone(),
         });
@@ -1447,12 +1439,27 @@ impl MultiBuffer {
         Some((buffer, anchor.text_anchor))
     }
 
-    fn on_buffer_event(
+    fn handle_buffer_event(
         &mut self,
         buffer: Model<Buffer>,
         event: &language::Event,
         cx: &mut ModelContext<Self>,
     ) {
+        if let language::Event::DirtyChanged = event {
+            if buffer
+                .read(cx)
+                .file()
+                .map_or(false, |file| file.is_deleted())
+            {
+                self.remove_excerpts(
+                    self.excerpts_for_buffer(&buffer, cx)
+                        .into_iter()
+                        .map(|(id, _)| id),
+                    cx,
+                );
+            }
+        }
+
         cx.emit(match event {
             language::Event::Edited => Event::Edited {
                 singleton_buffer_edited: true,
