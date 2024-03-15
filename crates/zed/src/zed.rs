@@ -10,7 +10,7 @@ use collections::VecDeque;
 use editor::{scroll::Autoscroll, Editor, MultiBuffer};
 use gpui::{
     actions, point, px, AppContext, AsyncAppContext, Context, FocusableView, PromptLevel,
-    TitlebarOptions, View, ViewContext, VisualContext, WindowBounds, WindowKind, WindowOptions,
+    TitlebarOptions, View, ViewContext, VisualContext, WindowKind, WindowOptions,
 };
 pub use only_instance::*;
 pub use open_listener::*;
@@ -79,12 +79,7 @@ pub fn init(cx: &mut AppContext) {
     cx.on_action(quit);
 }
 
-pub fn build_window_options(
-    bounds: Option<WindowBounds>,
-    display_uuid: Option<Uuid>,
-    cx: &mut AppContext,
-) -> WindowOptions {
-    let bounds = bounds.unwrap_or(WindowBounds::Maximized);
+pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut AppContext) -> WindowOptions {
     let display = display_uuid.and_then(|uuid| {
         cx.displays()
             .into_iter()
@@ -92,18 +87,18 @@ pub fn build_window_options(
     });
 
     WindowOptions {
-        bounds,
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
             traffic_light_position: Some(point(px(9.5), px(9.5))),
         }),
-        center: false,
+        bounds: None,
         focus: false,
         show: false,
         kind: WindowKind::Normal,
         is_movable: true,
         display_id: display.map(|display| display.id()),
+        fullscreen: false,
     }
 }
 
@@ -227,7 +222,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut AppContext) {
                 cx.zoom_window();
             })
             .register_action(|_, _: &ToggleFullScreen, cx| {
-                cx.toggle_full_screen();
+                cx.toggle_fullscreen();
             })
             .register_action(|_, action: &OpenZedUrl, cx| {
                 OpenListener::global(cx).open_urls(vec![action.url.clone()])
@@ -879,6 +874,41 @@ mod tests {
         open_new, open_paths, pane, NewFile, OpenVisible, SaveIntent, SplitDirection,
         WorkspaceHandle,
     };
+
+    #[gpui::test]
+    async fn test_open_non_existing_file(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                "/root",
+                json!({
+                    "a": {
+                    },
+                }),
+            )
+            .await;
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from("/root/a/new")],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+
+        let workspace = cx.windows()[0].downcast::<Workspace>().unwrap();
+        workspace
+            .update(cx, |workspace, cx| {
+                assert!(workspace.active_item_as::<Editor>(cx).is_some())
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     async fn test_open_paths_action(cx: &mut TestAppContext) {
@@ -1662,6 +1692,9 @@ mod tests {
                     },
                     "excluded_dir": {
                         "file": "excluded file contents",
+                        "ignored_subdir": {
+                            "file": "ignored subfile contents",
+                        },
                     },
                 }),
             )
@@ -2310,7 +2343,7 @@ mod tests {
             (file3.clone(), DisplayPoint::new(0, 0), 0.)
         );
 
-        // Go back to an item that has been closed and removed from disk, ensuring it gets skipped.
+        // Go back to an item that has been closed and removed from disk
         workspace
             .update(cx, |_, cx| {
                 pane.update(cx, |pane, cx| {
@@ -2336,7 +2369,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             active_location(&workspace, cx),
-            (file1.clone(), DisplayPoint::new(10, 0), 0.)
+            (file2.clone(), DisplayPoint::new(0, 0), 0.)
         );
         workspace
             .update(cx, |w, cx| w.go_forward(w.active_pane().downgrade(), cx))
@@ -2991,15 +3024,18 @@ mod tests {
     async fn test_bundled_languages(cx: &mut TestAppContext) {
         let settings = cx.update(|cx| SettingsStore::test(cx));
         cx.set_global(settings);
-        let mut languages = LanguageRegistry::test();
-        languages.set_executor(cx.executor().clone());
+        let languages = LanguageRegistry::test(cx.executor());
         let languages = Arc::new(languages);
         let node_runtime = node_runtime::FakeNodeRuntime::new();
         cx.update(|cx| {
             languages::init(languages.clone(), node_runtime, cx);
         });
         for name in languages.language_names() {
-            languages.language_for_name(&name).await.unwrap();
+            languages
+                .language_for_name(&name)
+                .await
+                .with_context(|| format!("language name {name}"))
+                .unwrap();
         }
         cx.run_until_parked();
     }

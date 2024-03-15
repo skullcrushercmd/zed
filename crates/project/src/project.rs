@@ -64,7 +64,7 @@ use worktree::LocalSnapshot;
 use rpc::{ErrorCode, ErrorExt as _};
 use search::SearchQuery;
 use serde::Serialize;
-use settings::{watch_config_file, Settings, SettingsStore};
+use settings::{watch_config_file, Settings, SettingsLocation, SettingsStore};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use smol::channel::{Receiver, Sender};
@@ -75,7 +75,7 @@ use std::{
     env,
     ffi::OsStr,
     hash::Hash,
-    mem,
+    io, mem,
     num::NonZeroU32,
     ops::Range,
     path::{self, Component, Path, PathBuf},
@@ -118,6 +118,13 @@ const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5
 pub const SERVER_PROGRESS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub trait Item {
+    fn try_open(
+        project: &Model<Project>,
+        path: &ProjectPath,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Model<Self>>>>
+    where
+        Self: Sized;
     fn entry_id(&self, cx: &AppContext) -> Option<ProjectEntryId>;
     fn project_path(&self, cx: &AppContext) -> Option<ProjectPath>;
 }
@@ -861,8 +868,7 @@ impl Project {
     ) -> Model<Project> {
         use clock::FakeSystemClock;
 
-        let mut languages = LanguageRegistry::test();
-        languages.set_executor(cx.executor());
+        let languages = LanguageRegistry::test(cx.executor());
         let clock = Arc::new(FakeSystemClock::default());
         let http_client = util::http::FakeHttpClient::with_404_response();
         let client = cx.update(|cx| client::Client::new(clock, http_client.clone(), cx));
@@ -1801,13 +1807,13 @@ impl Project {
                 let (mut tx, rx) = postage::watch::channel();
                 entry.insert(rx.clone());
 
+                let project_path = project_path.clone();
                 let load_buffer = if worktree.read(cx).is_local() {
-                    self.open_local_buffer_internal(&project_path.path, &worktree, cx)
+                    self.open_local_buffer_internal(project_path.path.clone(), worktree, cx)
                 } else {
                     self.open_remote_buffer_internal(&project_path.path, &worktree, cx)
                 };
 
-                let project_path = project_path.clone();
                 cx.spawn(move |this, mut cx| async move {
                     let load_result = load_buffer.await;
                     *tx.borrow_mut() = Some(this.update(&mut cx, |this, _| {
@@ -1832,17 +1838,32 @@ impl Project {
 
     fn open_local_buffer_internal(
         &mut self,
-        path: &Arc<Path>,
-        worktree: &Model<Worktree>,
+        path: Arc<Path>,
+        worktree: Model<Worktree>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Model<Buffer>>> {
         let buffer_id = self.next_buffer_id.next();
         let load_buffer = worktree.update(cx, |worktree, cx| {
             let worktree = worktree.as_local_mut().unwrap();
-            worktree.load_buffer(buffer_id, path, cx)
+            worktree.load_buffer(buffer_id, &path, cx)
         });
+        fn is_not_found_error(error: &anyhow::Error) -> bool {
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|err| err.kind() == io::ErrorKind::NotFound)
+        }
         cx.spawn(move |this, mut cx| async move {
-            let buffer = load_buffer.await?;
+            let buffer = match load_buffer.await {
+                Ok(buffer) => Ok(buffer),
+                Err(error) if is_not_found_error(&error) => {
+                    worktree.update(&mut cx, |worktree, cx| {
+                        let worktree = worktree.as_local_mut().unwrap();
+                        worktree.new_buffer(buffer_id, path, cx)
+                    })
+                }
+                Err(e) => Err(e),
+            }?;
             this.update(&mut cx, |this, cx| this.register_buffer(&buffer, cx))??;
             Ok(buffer)
         })
@@ -2761,11 +2782,11 @@ impl Project {
     ) -> Option<()> {
         // If the buffer has a language, set it and start the language server if we haven't already.
         let buffer = buffer_handle.read(cx);
-        let full_path = buffer.file()?.full_path(cx);
+        let file = buffer.file()?;
         let content = buffer.as_rope();
         let new_language = self
             .languages
-            .language_for_file(&full_path, Some(content))
+            .language_for_file(file, Some(content), cx)
             .now_or_never()?
             .ok()?;
         self.set_language_for_buffer(buffer_handle, new_language, cx);
@@ -2854,8 +2875,13 @@ impl Project {
             None => return,
         };
 
-        let project_settings =
-            ProjectSettings::get(Some((worktree_id.to_proto() as usize, Path::new(""))), cx);
+        let project_settings = ProjectSettings::get(
+            Some(SettingsLocation {
+                worktree_id: worktree_id.to_proto() as usize,
+                path: Path::new(""),
+            }),
+            cx,
+        );
         let lsp = project_settings.lsp.get(&adapter.name.0);
         let override_options = lsp.and_then(|s| s.initialization_options.clone());
 
@@ -3538,14 +3564,14 @@ impl Project {
             .into_iter()
             .filter_map(|buffer| {
                 let buffer = buffer.read(cx);
-                let file = File::from_dyn(buffer.file())?;
-                let full_path = file.full_path(cx);
+                let file = buffer.file()?;
+                let worktree = File::from_dyn(Some(file))?.worktree.clone();
                 let language = self
                     .languages
-                    .language_for_file(&full_path, Some(buffer.as_rope()))
+                    .language_for_file(file, Some(buffer.as_rope()), cx)
                     .now_or_never()?
                     .ok()?;
-                Some((file.worktree.clone(), language))
+                Some((worktree, language))
             })
             .collect();
         for (worktree, language) in language_server_lookup_info {
@@ -4885,11 +4911,15 @@ impl Project {
         if self.is_local() {
             let mut requests = Vec::new();
             for ((worktree_id, _), server_id) in self.language_server_ids.iter() {
-                let worktree_id = *worktree_id;
-                let worktree_handle = self.worktree_for_id(worktree_id, cx);
-                let worktree = match worktree_handle.and_then(|tree| tree.read(cx).as_local()) {
-                    Some(worktree) => worktree,
-                    None => continue,
+                let Some(worktree_handle) = self.worktree_for_id(*worktree_id, cx) else {
+                    continue;
+                };
+                let worktree = worktree_handle.read(cx);
+                if !worktree.is_visible() {
+                    continue;
+                }
+                let Some(worktree) = worktree.as_local() else {
+                    continue;
                 };
                 let worktree_abs_path = worktree.abs_path().clone();
 
@@ -4937,7 +4967,7 @@ impl Project {
                             (
                                 adapter,
                                 language,
-                                worktree_id,
+                                worktree_handle.downgrade(),
                                 worktree_abs_path,
                                 lsp_symbols,
                             )
@@ -4957,7 +4987,7 @@ impl Project {
                     for (
                         adapter,
                         adapter_language,
-                        source_worktree_id,
+                        source_worktree,
                         worktree_abs_path,
                         lsp_symbols,
                     ) in responses
@@ -4965,17 +4995,22 @@ impl Project {
                         symbols.extend(lsp_symbols.into_iter().filter_map(
                             |(symbol_name, symbol_kind, symbol_location)| {
                                 let abs_path = symbol_location.uri.to_file_path().ok()?;
-                                let mut worktree_id = source_worktree_id;
+                                let source_worktree = source_worktree.upgrade()?;
+                                let source_worktree_id = source_worktree.read(cx).id();
+
                                 let path;
-                                if let Some((worktree, rel_path)) =
+                                let worktree;
+                                if let Some((tree, rel_path)) =
                                     this.find_local_worktree(&abs_path, cx)
                                 {
-                                    worktree_id = worktree.read(cx).id();
+                                    worktree = tree;
                                     path = rel_path;
                                 } else {
+                                    worktree = source_worktree.clone();
                                     path = relativize_path(&worktree_abs_path, &abs_path);
                                 }
 
+                                let worktree_id = worktree.read(cx).id();
                                 let project_path = ProjectPath {
                                     worktree_id,
                                     path: path.into(),
@@ -4984,7 +5019,7 @@ impl Project {
                                 let adapter_language = adapter_language.clone();
                                 let language = this
                                     .languages
-                                    .language_for_file(&project_path.path, None)
+                                    .language_for_file_path(&project_path.path)
                                     .unwrap_or_else(move |_| adapter_language);
                                 let adapter = adapter.clone();
                                 Some(async move {
@@ -5207,16 +5242,19 @@ impl Project {
                     project_id.ok_or_else(|| anyhow!("Remote project without remote_id"))?;
 
                 for completion_index in completion_indices {
-                    let completions_guard = completions.read();
-                    let completion = &completions_guard[completion_index];
-                    if completion.documentation.is_some() {
-                        continue;
-                    }
+                    let (server_id, completion) = {
+                        let completions_guard = completions.read();
+                        let completion = &completions_guard[completion_index];
+                        if completion.documentation.is_some() {
+                            continue;
+                        }
 
-                    did_resolve = true;
-                    let server_id = completion.server_id;
-                    let completion = completion.lsp_completion.clone();
-                    drop(completions_guard);
+                        did_resolve = true;
+                        let server_id = completion.server_id;
+                        let completion = completion.lsp_completion.clone();
+
+                        (server_id, completion)
+                    };
 
                     Self::resolve_completion_documentation_remote(
                         project_id,
@@ -5231,15 +5269,18 @@ impl Project {
                 }
             } else {
                 for completion_index in completion_indices {
-                    let completions_guard = completions.read();
-                    let completion = &completions_guard[completion_index];
-                    if completion.documentation.is_some() {
-                        continue;
-                    }
+                    let (server_id, completion) = {
+                        let completions_guard = completions.read();
+                        let completion = &completions_guard[completion_index];
+                        if completion.documentation.is_some() {
+                            continue;
+                        }
 
-                    let server_id = completion.server_id;
-                    let completion = completion.lsp_completion.clone();
-                    drop(completions_guard);
+                        let server_id = completion.server_id;
+                        let completion = completion.lsp_completion.clone();
+
+                        (server_id, completion)
+                    };
 
                     let server = this
                         .read_with(&mut cx, |project, _| {
@@ -6138,6 +6179,7 @@ impl Project {
                 Some(tree.snapshot())
             })
             .collect::<Vec<_>>();
+        let include_root = snapshots.len() > 1;
 
         let background = cx.background_executor().clone();
         let path_count: usize = snapshots
@@ -6171,8 +6213,18 @@ impl Project {
                 });
                 if is_ignored && !query.include_ignored() {
                     return None;
-                } else if let Some(path) = snapshot.file().map(|file| file.path()) {
-                    Some((path.clone(), (buffer, snapshot)))
+                } else if let Some(file) = snapshot.file() {
+                    let matched_path = if include_root {
+                        query.file_matches(Some(&file.full_path(cx)))
+                    } else {
+                        query.file_matches(Some(file.path()))
+                    };
+
+                    if matched_path {
+                        Some((file.path().clone(), (buffer, snapshot)))
+                    } else {
+                        None
+                    }
                 } else {
                     unnamed_files.push(buffer);
                     None
@@ -6187,6 +6239,7 @@ impl Project {
                 self.fs.clone(),
                 workers,
                 query.clone(),
+                include_root,
                 path_count,
                 snapshots,
                 matching_paths_tx,
@@ -6223,21 +6276,15 @@ impl Project {
                                 while let Some((entry, buffer_index)) = buffers_rx.next().await {
                                     let buffer_matches = if let Some((_, snapshot)) = entry.as_ref()
                                     {
-                                        if query.file_matches(
-                                            snapshot.file().map(|file| file.path().as_ref()),
-                                        ) {
-                                            query
-                                                .search(snapshot, None)
-                                                .await
-                                                .iter()
-                                                .map(|range| {
-                                                    snapshot.anchor_before(range.start)
-                                                        ..snapshot.anchor_after(range.end)
-                                                })
-                                                .collect()
-                                        } else {
-                                            Vec::new()
-                                        }
+                                        query
+                                            .search(snapshot, None)
+                                            .await
+                                            .iter()
+                                            .map(|range| {
+                                                snapshot.anchor_before(range.start)
+                                                    ..snapshot.anchor_after(range.end)
+                                            })
+                                            .collect()
                                     } else {
                                         Vec::new()
                                     };
@@ -6309,6 +6356,7 @@ impl Project {
         fs: Arc<dyn Fs>,
         workers: usize,
         query: SearchQuery,
+        include_root: bool,
         path_count: usize,
         snapshots: Vec<LocalSnapshot>,
         matching_paths_tx: Sender<SearchMatchCandidate>,
@@ -6377,7 +6425,16 @@ impl Project {
                                     if unnamed_buffers.contains_key(&entry.path) {
                                         continue;
                                     }
-                                    let matches = if query.file_matches(Some(&entry.path)) {
+
+                                    let matched_path = if include_root {
+                                        let mut full_path = PathBuf::from(snapshot.root_name());
+                                        full_path.push(&entry.path);
+                                        query.file_matches(Some(&full_path))
+                                    } else {
+                                        query.file_matches(Some(&entry.path))
+                                    };
+
+                                    let matches = if matched_path {
                                         abs_path.clear();
                                         abs_path.push(&snapshot.abs_path());
                                         abs_path.push(&entry.path);
@@ -8005,7 +8062,7 @@ impl Project {
             project_id,
             buffer_id: buffer_id.into(),
             version: serialize_version(buffer.saved_version()),
-            mtime: Some(buffer.saved_mtime().into()),
+            mtime: buffer.saved_mtime().map(|time| time.into()),
             fingerprint: language::proto::serialize_fingerprint(buffer.saved_version_fingerprint()),
         })
     }
@@ -8098,7 +8155,7 @@ impl Project {
                             project_id,
                             buffer_id: buffer_id.into(),
                             version: language::proto::serialize_version(buffer.saved_version()),
-                            mtime: Some(buffer.saved_mtime().into()),
+                            mtime: buffer.saved_mtime().map(|time| time.into()),
                             fingerprint: language::proto::serialize_fingerprint(
                                 buffer.saved_version_fingerprint(),
                             ),
@@ -8523,7 +8580,7 @@ impl Project {
             .symbol
             .ok_or_else(|| anyhow!("invalid symbol"))?;
         let symbol = this
-            .update(&mut cx, |this, _| this.deserialize_symbol(symbol))?
+            .update(&mut cx, |this, _cx| this.deserialize_symbol(symbol))?
             .await?;
         let symbol = this.update(&mut cx, |this, _| {
             let signature = this.symbol_signature(&symbol.path);
@@ -8913,27 +8970,26 @@ impl Project {
         serialized_symbol: proto::Symbol,
     ) -> impl Future<Output = Result<Symbol>> {
         let languages = self.languages.clone();
+        let source_worktree_id = WorktreeId::from_proto(serialized_symbol.source_worktree_id);
+        let worktree_id = WorktreeId::from_proto(serialized_symbol.worktree_id);
+        let kind = unsafe { mem::transmute(serialized_symbol.kind) };
+        let path = ProjectPath {
+            worktree_id,
+            path: PathBuf::from(serialized_symbol.path).into(),
+        };
+        let language = languages.language_for_file_path(&path.path);
+
         async move {
-            let source_worktree_id = WorktreeId::from_proto(serialized_symbol.source_worktree_id);
-            let worktree_id = WorktreeId::from_proto(serialized_symbol.worktree_id);
+            let language = language.await.log_err();
+            let adapter = language
+                .as_ref()
+                .and_then(|language| languages.lsp_adapters(language).first().cloned());
             let start = serialized_symbol
                 .start
                 .ok_or_else(|| anyhow!("invalid start"))?;
             let end = serialized_symbol
                 .end
                 .ok_or_else(|| anyhow!("invalid end"))?;
-            let kind = unsafe { mem::transmute(serialized_symbol.kind) };
-            let path = ProjectPath {
-                worktree_id,
-                path: PathBuf::from(serialized_symbol.path).into(),
-            };
-            let language = languages
-                .language_for_file(&path.path, None)
-                .await
-                .log_err();
-            let adapter = language
-                .as_ref()
-                .and_then(|language| languages.lsp_adapters(language).first().cloned());
             Ok(Symbol {
                 language_server_name: LanguageServerName(
                     serialized_symbol.language_server_name.into(),
@@ -8973,11 +9029,7 @@ impl Project {
         let fingerprint = deserialize_fingerprint(&envelope.payload.fingerprint)?;
         let version = deserialize_version(&envelope.payload.version);
         let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
-        let mtime = envelope
-            .payload
-            .mtime
-            .ok_or_else(|| anyhow!("missing mtime"))?
-            .into();
+        let mtime = envelope.payload.mtime.map(|time| time.into());
 
         this.update(&mut cx, |this, cx| {
             let buffer = this
@@ -9011,10 +9063,7 @@ impl Project {
             proto::LineEnding::from_i32(payload.line_ending)
                 .ok_or_else(|| anyhow!("missing line ending"))?,
         );
-        let mtime = payload
-            .mtime
-            .ok_or_else(|| anyhow!("missing mtime"))?
-            .into();
+        let mtime = payload.mtime.map(|time| time.into());
         let buffer_id = BufferId::new(payload.buffer_id)?;
         this.update(&mut cx, |this, cx| {
             let buffer = this
@@ -9411,6 +9460,15 @@ impl<'a> Iterator for PathMatchCandidateSetIter<'a> {
 
 impl EventEmitter<Event> for Project {}
 
+impl<'a> Into<SettingsLocation<'a>> for &'a ProjectPath {
+    fn into(self) -> SettingsLocation<'a> {
+        SettingsLocation {
+            worktree_id: self.worktree_id.to_usize(),
+            path: self.path.as_ref(),
+        }
+    }
+}
+
 impl<P: AsRef<Path>> From<(WorktreeId, P)> for ProjectPath {
     fn from((worktree_id, path): (WorktreeId, P)) -> Self {
         Self {
@@ -9565,6 +9623,14 @@ fn resolve_path(base: &Path, path: &Path) -> PathBuf {
 }
 
 impl Item for Buffer {
+    fn try_open(
+        project: &Model<Project>,
+        path: &ProjectPath,
+        cx: &mut AppContext,
+    ) -> Option<Task<Result<Model<Self>>>> {
+        Some(project.update(cx, |project, cx| project.open_buffer(path.clone(), cx)))
+    }
+
     fn entry_id(&self, cx: &AppContext) -> Option<ProjectEntryId> {
         File::from_dyn(self.file()).and_then(|file| file.project_entry_id(cx))
     }

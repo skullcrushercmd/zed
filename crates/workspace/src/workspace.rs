@@ -26,13 +26,13 @@ use futures::{
     Future, FutureExt, StreamExt,
 };
 use gpui::{
-    actions, canvas, div, impl_actions, point, px, size, Action, AnyElement, AnyModel, AnyView,
-    AnyWeakView, AppContext, AsyncAppContext, AsyncWindowContext, Bounds, Context, Div,
-    DragMoveEvent, Element, ElementContext, Entity, EntityId, EventEmitter, FocusHandle,
-    FocusableView, Global, GlobalPixels, InteractiveElement, IntoElement, KeyContext, Keystroke,
-    LayoutId, ManagedView, Model, ModelContext, ParentElement, PathPromptOptions, Pixels, Point,
-    PromptLevel, Render, SharedString, Size, Styled, Subscription, Task, View, ViewContext,
-    VisualContext, WeakView, WindowBounds, WindowContext, WindowHandle, WindowOptions,
+    actions, canvas, div, impl_actions, point, size, Action, AnyElement, AnyView, AnyWeakView,
+    AppContext, AsyncAppContext, AsyncWindowContext, Bounds, Context, Div, DragMoveEvent, Element,
+    ElementContext, Entity, EntityId, EventEmitter, FocusHandle, FocusableView, Global,
+    GlobalPixels, InteractiveElement, IntoElement, KeyContext, Keystroke, LayoutId, ManagedView,
+    Model, ModelContext, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel, Render,
+    SharedString, Size, Styled, Subscription, Task, View, ViewContext, VisualContext, WeakView,
+    WindowContext, WindowHandle, WindowOptions,
 };
 use item::{FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, ProjectItem};
 use itertools::Itertools;
@@ -275,17 +275,37 @@ pub fn init(app_state: Arc<AppState>, cx: &mut AppContext) {
 }
 
 #[derive(Clone, Default, Deref, DerefMut)]
-struct ProjectItemBuilders(
-    HashMap<TypeId, fn(Model<Project>, AnyModel, &mut ViewContext<Pane>) -> Box<dyn ItemHandle>>,
-);
+struct ProjectItemOpeners(Vec<ProjectItemOpener>);
 
-impl Global for ProjectItemBuilders {}
+type ProjectItemOpener = fn(
+    &Model<Project>,
+    &ProjectPath,
+    &mut WindowContext,
+)
+    -> Option<Task<Result<(Option<ProjectEntryId>, WorkspaceItemBuilder)>>>;
 
+type WorkspaceItemBuilder = Box<dyn FnOnce(&mut ViewContext<Pane>) -> Box<dyn ItemHandle>>;
+
+impl Global for ProjectItemOpeners {}
+
+/// Registers a [ProjectItem] for the app. When opening a file, all the registered
+/// items will get a chance to open the file, starting from the project item that
+/// was added last.
 pub fn register_project_item<I: ProjectItem>(cx: &mut AppContext) {
-    let builders = cx.default_global::<ProjectItemBuilders>();
-    builders.insert(TypeId::of::<I::Item>(), |project, model, cx| {
-        let item = model.downcast::<I::Item>().unwrap();
-        Box::new(cx.new_view(|cx| I::for_project_item(project, item, cx)))
+    let builders = cx.default_global::<ProjectItemOpeners>();
+    builders.push(|project, project_path, cx| {
+        let project_item = <I::Item as project::Item>::try_open(&project, project_path, cx)?;
+        let project = project.clone();
+        Some(cx.spawn(|cx| async move {
+            let project_item = project_item.await?;
+            let project_entry_id: Option<ProjectEntryId> =
+                project_item.read_with(&cx, |item, cx| project::Item::entry_id(item, cx))?;
+            let build_workspace_item = Box::new(|cx: &mut ViewContext<Pane>| {
+                Box::new(cx.new_view(|cx| I::for_project_item(project, project_item, cx)))
+                    as Box<dyn ItemHandle>
+            }) as Box<_>;
+            Ok((project_entry_id, build_workspace_item))
+        }))
     });
 }
 
@@ -362,8 +382,7 @@ pub struct AppState {
     pub user_store: Model<UserStore>,
     pub workspace_store: Model<WorkspaceStore>,
     pub fs: Arc<dyn fs::Fs>,
-    pub build_window_options:
-        fn(Option<WindowBounds>, Option<Uuid>, &mut AppContext) -> WindowOptions,
+    pub build_window_options: fn(Option<Uuid>, &mut AppContext) -> WindowOptions,
     pub node_runtime: Arc<dyn NodeRuntime>,
 }
 
@@ -406,7 +425,7 @@ impl AppState {
         }
 
         let fs = fs::FakeFs::new(cx.background_executor().clone());
-        let languages = Arc::new(LanguageRegistry::test());
+        let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
         let clock = Arc::new(clock::FakeSystemClock::default());
         let http_client = util::http::FakeHttpClient::with_404_response();
         let client = Client::new(clock, http_client.clone(), cx);
@@ -424,7 +443,7 @@ impl AppState {
             user_store,
             workspace_store,
             node_runtime: FakeNodeRuntime::new(),
-            build_window_options: |_, _, _| Default::default(),
+            build_window_options: |_, _| Default::default(),
         })
     }
 }
@@ -619,6 +638,7 @@ impl Workspace {
                 project.clone(),
                 pane_history_timestamp.clone(),
                 None,
+                NewFile.boxed_clone(),
                 cx,
             )
         });
@@ -690,21 +710,32 @@ impl Workspace {
             cx.observe_window_bounds(move |_, cx| {
                 if let Some(display) = cx.display() {
                     // Transform fixed bounds to be stored in terms of the containing display
-                    let mut bounds = cx.window_bounds();
-                    if let WindowBounds::Fixed(window_bounds) = &mut bounds {
-                        let display_bounds = display.bounds();
-                        window_bounds.origin.x -= display_bounds.origin.x;
-                        window_bounds.origin.y -= display_bounds.origin.y;
-                    }
+                    let mut window_bounds = cx.window_bounds();
+                    let display_bounds = display.bounds();
+                    window_bounds.origin.x -= display_bounds.origin.x;
+                    window_bounds.origin.y -= display_bounds.origin.y;
+                    let fullscreen = cx.is_fullscreen();
 
                     if let Some(display_uuid) = display.uuid().log_err() {
-                        cx.background_executor()
-                            .spawn(DB.set_window_bounds(
-                                workspace_id,
-                                SerializedWindowsBounds(bounds),
-                                display_uuid,
-                            ))
-                            .detach_and_log_err(cx);
+                        // Only update the window bounds when not full screen,
+                        // so we can remember the last non-fullscreen bounds
+                        // across restarts
+                        if fullscreen {
+                            cx.background_executor()
+                                .spawn(DB.set_fullscreen(workspace_id, true))
+                                .detach_and_log_err(cx);
+                        } else {
+                            cx.background_executor()
+                                .spawn(DB.set_fullscreen(workspace_id, false))
+                                .detach_and_log_err(cx);
+                            cx.background_executor()
+                                .spawn(DB.set_window_bounds(
+                                    workspace_id,
+                                    SerializedWindowsBounds(window_bounds),
+                                    display_uuid,
+                                ))
+                                .detach_and_log_err(cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -836,40 +867,41 @@ impl Workspace {
                 window
             } else {
                 let window_bounds_override = window_bounds_env_override(&cx);
-                let (bounds, display) = if let Some(bounds) = window_bounds_override {
-                    (Some(bounds), None)
-                } else {
-                    serialized_workspace
-                        .as_ref()
-                        .and_then(|serialized_workspace| {
-                            let serialized_display = serialized_workspace.display?;
-                            let mut bounds = serialized_workspace.bounds?;
 
-                            // Stored bounds are relative to the containing display.
-                            // So convert back to global coordinates if that screen still exists
-                            if let WindowBounds::Fixed(mut window_bounds) = bounds {
-                                let screen = cx
-                                    .update(|cx| {
-                                        cx.displays().into_iter().find(|display| {
-                                            display.uuid().ok() == Some(serialized_display)
-                                        })
-                                    })
-                                    .ok()??;
-                                let screen_bounds = screen.bounds();
-                                window_bounds.origin.x += screen_bounds.origin.x;
-                                window_bounds.origin.y += screen_bounds.origin.y;
-                                bounds = WindowBounds::Fixed(window_bounds);
-                            }
-
-                            Some((bounds, serialized_display))
+                let (bounds, display, fullscreen) = if let Some(bounds) = window_bounds_override {
+                    (Some(bounds), None, false)
+                } else if let Some((serialized_display, mut bounds, fullscreen)) =
+                    serialized_workspace.as_ref().and_then(|workspace| {
+                        Some((workspace.display?, workspace.bounds?, workspace.fullscreen))
+                    })
+                {
+                    // Stored bounds are relative to the containing display.
+                    // So convert back to global coordinates if that screen still exists
+                    let screen_bounds = cx
+                        .update(|cx| {
+                            cx.displays()
+                                .into_iter()
+                                .find(|display| display.uuid().ok() == Some(serialized_display))
                         })
-                        .unzip()
+                        .ok()
+                        .flatten()
+                        .map(|screen| screen.bounds());
+
+                    if let Some(screen_bounds) = screen_bounds {
+                        bounds.origin.x += screen_bounds.origin.x;
+                        bounds.origin.y += screen_bounds.origin.y;
+                    }
+
+                    (Some(bounds), Some(serialized_display), fullscreen)
+                } else {
+                    let display = DB.last_monitor().log_err().flatten();
+                    (None, display, false)
                 };
 
                 // Use the serialized workspace to construct the new window
-                let options =
-                    cx.update(|cx| (app_state.build_window_options)(bounds, display, cx))?;
-
+                let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx))?;
+                options.bounds = bounds;
+                options.fullscreen = fullscreen;
                 cx.open_window(options, {
                     let app_state = app_state.clone();
                     let project_handle = project_handle.clone();
@@ -1454,18 +1486,12 @@ impl Workspace {
                     OpenVisible::None => Some(false),
                     OpenVisible::OnlyFiles => match fs.metadata(abs_path).await.log_err() {
                         Some(Some(metadata)) => Some(!metadata.is_dir),
-                        Some(None) => {
-                            log::error!("No metadata for file {abs_path:?}");
-                            None
-                        }
+                        Some(None) => Some(true),
                         None => None,
                     },
                     OpenVisible::OnlyDirectories => match fs.metadata(abs_path).await.log_err() {
                         Some(Some(metadata)) => Some(metadata.is_dir),
-                        Some(None) => {
-                            log::error!("No metadata for file {abs_path:?}");
-                            None
-                        }
+                        Some(None) => Some(false),
                         None => None,
                     },
                 };
@@ -1493,15 +1519,7 @@ impl Workspace {
                 let pane = pane.clone();
                 let task = cx.spawn(move |mut cx| async move {
                     let (worktree, project_path) = project_path?;
-                    if fs.is_file(&abs_path).await {
-                        Some(
-                            this.update(&mut cx, |this, cx| {
-                                this.open_path(project_path, pane, true, cx)
-                            })
-                            .log_err()?
-                            .await,
-                        )
-                    } else {
+                    if fs.is_dir(&abs_path).await {
                         this.update(&mut cx, |workspace, cx| {
                             let worktree = worktree.read(cx);
                             let worktree_abs_path = worktree.abs_path();
@@ -1524,6 +1542,14 @@ impl Workspace {
                         })
                         .log_err()?;
                         None
+                    } else {
+                        Some(
+                            this.update(&mut cx, |this, cx| {
+                                this.open_path(project_path, pane, true, cx)
+                            })
+                            .log_err()?
+                            .await,
+                        )
                     }
                 });
                 tasks.push(task);
@@ -1873,6 +1899,7 @@ impl Workspace {
                 self.project.clone(),
                 self.pane_history_timestamp.clone(),
                 None,
+                NewFile.boxed_clone(),
                 cx,
             )
         });
@@ -2044,26 +2071,17 @@ impl Workspace {
         &mut self,
         path: ProjectPath,
         cx: &mut WindowContext,
-    ) -> Task<
-        Result<(
-            Option<ProjectEntryId>,
-            impl 'static + Send + FnOnce(&mut ViewContext<Pane>) -> Box<dyn ItemHandle>,
-        )>,
-    > {
+    ) -> Task<Result<(Option<ProjectEntryId>, WorkspaceItemBuilder)>> {
         let project = self.project().clone();
-        let project_item = project.update(cx, |project, cx| project.open_path(path, cx));
-        cx.spawn(|mut cx| async move {
-            let (project_entry_id, project_item) = project_item.await?;
-            let build_item = cx.update(|cx| {
-                cx.default_global::<ProjectItemBuilders>()
-                    .get(&project_item.entity_type())
-                    .ok_or_else(|| anyhow!("no item builder for project item"))
-                    .cloned()
-            })??;
-            let build_item =
-                move |cx: &mut ViewContext<Pane>| build_item(project, project_item, cx);
-            Ok((project_entry_id, build_item))
-        })
+        let project_item_builders = cx.default_global::<ProjectItemOpeners>().clone();
+        let Some(open_project_item) = project_item_builders
+            .iter()
+            .rev()
+            .find_map(|open_project_item| open_project_item(&project, &path, cx))
+        else {
+            return Task::ready(Err(anyhow!("cannot open file {:?}", path.path)));
+        };
+        open_project_item
     }
 
     pub fn open_project_item<T>(
@@ -2674,7 +2692,7 @@ impl Workspace {
         if self
             .follower_states
             .values()
-            .all(|state| state.leader_id != state.leader_id)
+            .all(|state| state.leader_id != leader_id)
         {
             let project_id = self.project.read(cx).remote_id();
             let room_id = self.active_call()?.read(cx).room()?.read(cx).id();
@@ -3431,6 +3449,7 @@ impl Workspace {
                     bounds: Default::default(),
                     display: Default::default(),
                     docks,
+                    fullscreen: cx.is_fullscreen(),
                 };
 
                 cx.spawn(|_| persistence::DB.save_workspace(serialized_workspace))
@@ -3610,7 +3629,7 @@ impl Workspace {
             client,
             user_store,
             fs: project.read(cx).fs().clone(),
-            build_window_options: |_, _, _| Default::default(),
+            build_window_options: |_, _| Default::default(),
             node_runtime: FakeNodeRuntime::new(),
         });
         let workspace = Self::new(0, project, app_state, cx);
@@ -3663,17 +3682,15 @@ impl Workspace {
     }
 }
 
-fn window_bounds_env_override(cx: &AsyncAppContext) -> Option<WindowBounds> {
+fn window_bounds_env_override(cx: &AsyncAppContext) -> Option<Bounds<GlobalPixels>> {
     let display_origin = cx
         .update(|cx| Some(cx.displays().first()?.bounds().origin))
         .ok()??;
     ZED_WINDOW_POSITION
         .zip(*ZED_WINDOW_SIZE)
-        .map(|(position, size)| {
-            WindowBounds::Fixed(Bounds {
-                origin: display_origin + position,
-                size,
-            })
+        .map(|(position, size)| Bounds {
+            origin: display_origin + position,
+            size,
         })
 }
 
@@ -3740,7 +3757,9 @@ fn open_items(
                         let fs = app_state.fs.clone();
                         async move {
                             let file_project_path = project_path?;
-                            if fs.is_file(&abs_path).await {
+                            if fs.is_dir(&abs_path).await {
+                                None
+                            } else {
                                 Some((
                                     ix,
                                     workspace
@@ -3750,8 +3769,6 @@ fn open_items(
                                         .log_err()?
                                         .await,
                                 ))
-                            } else {
-                                None
                             }
                         }
                     })
@@ -4393,6 +4410,18 @@ fn activate_any_workspace_window(cx: &mut AsyncAppContext) -> Option<WindowHandl
     .flatten()
 }
 
+fn local_workspace_windows(cx: &AppContext) -> Vec<WindowHandle<Workspace>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Workspace>())
+        .filter(|workspace| {
+            workspace
+                .read(cx)
+                .is_ok_and(|workspace| workspace.project.read(cx).is_local())
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct OpenOptions {
     pub open_new_workspace: Option<bool>,
@@ -4417,20 +4446,17 @@ pub fn open_paths(
     let mut open_visible = OpenVisible::All;
 
     if open_options.open_new_workspace != Some(true) {
-        for window in cx.windows() {
-            let Some(handle) = window.downcast::<Workspace>() else {
-                continue;
-            };
-            if let Ok(workspace) = handle.read(cx) {
+        for window in local_workspace_windows(cx) {
+            if let Ok(workspace) = window.read(cx) {
                 let m = workspace
-                    .project()
+                    .project
                     .read(cx)
                     .visibility_for_paths(&abs_paths, cx);
                 if m > best_match {
-                    existing = Some(handle);
+                    existing = Some(window);
                     best_match = m;
                 } else if best_match.is_none() && open_options.open_new_workspace == Some(false) {
-                    existing = Some(handle)
+                    existing = Some(window)
                 }
             }
         }
@@ -4445,8 +4471,19 @@ pub fn open_paths(
                 .filter_map(|result| result.ok().flatten())
                 .all(|file| !file.is_dir)
             {
-                existing = activate_any_workspace_window(&mut cx);
-                open_visible = OpenVisible::None;
+                cx.update(|cx| {
+                    for window in local_workspace_windows(cx) {
+                        if let Ok(workspace) = window.read(cx) {
+                            let project = workspace.project().read(cx);
+                            if project.is_remote() {
+                                continue;
+                            }
+                            existing = Some(window);
+                            open_visible = OpenVisible::None;
+                            break;
+                        }
+                    }
+                })?;
             }
         }
 
@@ -4553,7 +4590,8 @@ pub fn join_hosted_project(
 
             let window_bounds_override = window_bounds_env_override(&cx);
             cx.update(|cx| {
-                let options = (app_state.build_window_options)(window_bounds_override, None, cx);
+                let mut options = (app_state.build_window_options)(None, cx);
+                options.bounds = window_bounds_override;
                 cx.open_window(options, |cx| {
                     cx.new_view(|cx| Workspace::new(0, project, app_state.clone(), cx))
                 })
@@ -4611,7 +4649,8 @@ pub fn join_in_room_project(
 
             let window_bounds_override = window_bounds_env_override(&cx);
             cx.update(|cx| {
-                let options = (app_state.build_window_options)(window_bounds_override, None, cx);
+                let mut options = (app_state.build_window_options)(None, cx);
+                options.bounds = window_bounds_override;
                 cx.open_window(options, |cx| {
                     cx.new_view(|cx| Workspace::new(0, project, app_state.clone(), cx))
                 })
@@ -4714,10 +4753,6 @@ fn parse_pixel_size_env_var(value: &str) -> Option<Size<GlobalPixels>> {
     Some(size((width as f64).into(), (height as f64).into()))
 }
 
-pub fn titlebar_height(cx: &mut WindowContext) -> Pixels {
-    (1.75 * cx.rem_size()).max(px(32.))
-}
-
 struct DisconnectedOverlay;
 
 impl Element for DisconnectedOverlay {
@@ -4731,7 +4766,7 @@ impl Element for DisconnectedOverlay {
             .bg(background)
             .absolute()
             .left_0()
-            .top(titlebar_height(cx))
+            .top(cx.titlebar_height())
             .size_full()
             .flex()
             .items_center()
@@ -4787,7 +4822,7 @@ mod tests {
         },
     };
     use fs::FakeFs;
-    use gpui::{px, DismissEvent, TestAppContext, VisualTestContext};
+    use gpui::{px, DismissEvent, Empty, TestAppContext, VisualTestContext};
     use project::{Project, ProjectEntryId};
     use serde_json::json;
     use settings::SettingsStore;
@@ -5220,6 +5255,11 @@ mod tests {
         cx.deactivate_window();
         item.update(cx, |item, _| assert_eq!(item.save_count, 1));
 
+        // Re-activating the window doesn't save the file.
+        cx.update(|cx| cx.activate_window());
+        cx.executor().run_until_parked();
+        item.update(cx, |item, _| assert_eq!(item.save_count, 1));
+
         // Autosave on focus change.
         item.update(cx, |item, cx| {
             cx.focus_self();
@@ -5237,13 +5277,11 @@ mod tests {
         item.update(cx, |item, _| assert_eq!(item.save_count, 2));
 
         // Deactivating the window still saves the file.
-        cx.update(|cx| cx.activate_window());
         item.update(cx, |item, cx| {
             cx.focus_self();
             item.is_dirty = true;
         });
         cx.deactivate_window();
-
         item.update(cx, |item, _| assert_eq!(item.save_count, 3));
 
         // Autosave after delay.
@@ -5758,6 +5796,293 @@ mod tests {
             let right_dock = workspace.right_dock();
             assert!(!right_dock.read(cx).is_open());
         });
+    }
+
+    mod register_project_item_tests {
+        use super::*;
+
+        const TEST_PNG_KIND: &str = "TestPngItemView";
+        // View
+        struct TestPngItemView {
+            focus_handle: FocusHandle,
+        }
+        // Model
+        struct TestPngItem {}
+
+        impl project::Item for TestPngItem {
+            fn try_open(
+                _project: &Model<Project>,
+                path: &ProjectPath,
+                cx: &mut AppContext,
+            ) -> Option<Task<gpui::Result<Model<Self>>>> {
+                if path.path.extension().unwrap() == "png" {
+                    Some(cx.spawn(|mut cx| async move { cx.new_model(|_| TestPngItem {}) }))
+                } else {
+                    None
+                }
+            }
+
+            fn entry_id(&self, _: &AppContext) -> Option<ProjectEntryId> {
+                None
+            }
+
+            fn project_path(&self, _: &AppContext) -> Option<ProjectPath> {
+                None
+            }
+        }
+
+        impl Item for TestPngItemView {
+            type Event = ();
+
+            fn serialized_item_kind() -> Option<&'static str> {
+                Some(TEST_PNG_KIND)
+            }
+        }
+        impl EventEmitter<()> for TestPngItemView {}
+        impl FocusableView for TestPngItemView {
+            fn focus_handle(&self, _cx: &AppContext) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+
+        impl Render for TestPngItemView {
+            fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
+
+        impl ProjectItem for TestPngItemView {
+            type Item = TestPngItem;
+
+            fn for_project_item(
+                _project: Model<Project>,
+                _item: Model<Self::Item>,
+                cx: &mut ViewContext<Self>,
+            ) -> Self
+            where
+                Self: Sized,
+            {
+                Self {
+                    focus_handle: cx.focus_handle(),
+                }
+            }
+        }
+
+        const TEST_IPYNB_KIND: &str = "TestIpynbItemView";
+        // View
+        struct TestIpynbItemView {
+            focus_handle: FocusHandle,
+        }
+        // Model
+        struct TestIpynbItem {}
+
+        impl project::Item for TestIpynbItem {
+            fn try_open(
+                _project: &Model<Project>,
+                path: &ProjectPath,
+                cx: &mut AppContext,
+            ) -> Option<Task<gpui::Result<Model<Self>>>> {
+                if path.path.extension().unwrap() == "ipynb" {
+                    Some(cx.spawn(|mut cx| async move { cx.new_model(|_| TestIpynbItem {}) }))
+                } else {
+                    None
+                }
+            }
+
+            fn entry_id(&self, _: &AppContext) -> Option<ProjectEntryId> {
+                None
+            }
+
+            fn project_path(&self, _: &AppContext) -> Option<ProjectPath> {
+                None
+            }
+        }
+
+        impl Item for TestIpynbItemView {
+            type Event = ();
+
+            fn serialized_item_kind() -> Option<&'static str> {
+                Some(TEST_IPYNB_KIND)
+            }
+        }
+        impl EventEmitter<()> for TestIpynbItemView {}
+        impl FocusableView for TestIpynbItemView {
+            fn focus_handle(&self, _cx: &AppContext) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+
+        impl Render for TestIpynbItemView {
+            fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
+
+        impl ProjectItem for TestIpynbItemView {
+            type Item = TestIpynbItem;
+
+            fn for_project_item(
+                _project: Model<Project>,
+                _item: Model<Self::Item>,
+                cx: &mut ViewContext<Self>,
+            ) -> Self
+            where
+                Self: Sized,
+            {
+                Self {
+                    focus_handle: cx.focus_handle(),
+                }
+            }
+        }
+
+        struct TestAlternatePngItemView {
+            focus_handle: FocusHandle,
+        }
+
+        const TEST_ALTERNATE_PNG_KIND: &str = "TestAlternatePngItemView";
+        impl Item for TestAlternatePngItemView {
+            type Event = ();
+
+            fn serialized_item_kind() -> Option<&'static str> {
+                Some(TEST_ALTERNATE_PNG_KIND)
+            }
+        }
+        impl EventEmitter<()> for TestAlternatePngItemView {}
+        impl FocusableView for TestAlternatePngItemView {
+            fn focus_handle(&self, _cx: &AppContext) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+
+        impl Render for TestAlternatePngItemView {
+            fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
+
+        impl ProjectItem for TestAlternatePngItemView {
+            type Item = TestPngItem;
+
+            fn for_project_item(
+                _project: Model<Project>,
+                _item: Model<Self::Item>,
+                cx: &mut ViewContext<Self>,
+            ) -> Self
+            where
+                Self: Sized,
+            {
+                Self {
+                    focus_handle: cx.focus_handle(),
+                }
+            }
+        }
+
+        #[gpui::test]
+        async fn test_register_project_item(cx: &mut TestAppContext) {
+            init_test(cx);
+
+            cx.update(|cx| {
+                register_project_item::<TestPngItemView>(cx);
+                register_project_item::<TestIpynbItemView>(cx);
+            });
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                "/root1",
+                json!({
+                    "one.png": "BINARYDATAHERE",
+                    "two.ipynb": "{ totally a notebook }",
+                    "three.txt": "editing text, sure why not?"
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs, ["root1".as_ref()], cx).await;
+            let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
+
+            let worktree_id = project.update(cx, |project, cx| {
+                project.worktrees().next().unwrap().read(cx).id()
+            });
+
+            let handle = workspace
+                .update(cx, |workspace, cx| {
+                    let project_path = (worktree_id, "one.png");
+                    workspace.open_path(project_path, None, true, cx)
+                })
+                .await
+                .unwrap();
+
+            // Now we can check if the handle we got back errored or not
+            assert_eq!(handle.serialized_item_kind().unwrap(), TEST_PNG_KIND);
+
+            let handle = workspace
+                .update(cx, |workspace, cx| {
+                    let project_path = (worktree_id, "two.ipynb");
+                    workspace.open_path(project_path, None, true, cx)
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(handle.serialized_item_kind().unwrap(), TEST_IPYNB_KIND);
+
+            let handle = workspace
+                .update(cx, |workspace, cx| {
+                    let project_path = (worktree_id, "three.txt");
+                    workspace.open_path(project_path, None, true, cx)
+                })
+                .await;
+            assert!(handle.is_err());
+        }
+
+        #[gpui::test]
+        async fn test_register_project_item_two_enter_one_leaves(cx: &mut TestAppContext) {
+            init_test(cx);
+
+            cx.update(|cx| {
+                register_project_item::<TestPngItemView>(cx);
+                register_project_item::<TestAlternatePngItemView>(cx);
+            });
+
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                "/root1",
+                json!({
+                    "one.png": "BINARYDATAHERE",
+                    "two.ipynb": "{ totally a notebook }",
+                    "three.txt": "editing text, sure why not?"
+                }),
+            )
+            .await;
+
+            let project = Project::test(fs, ["root1".as_ref()], cx).await;
+            let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
+
+            let worktree_id = project.update(cx, |project, cx| {
+                project.worktrees().next().unwrap().read(cx).id()
+            });
+
+            let handle = workspace
+                .update(cx, |workspace, cx| {
+                    let project_path = (worktree_id, "one.png");
+                    workspace.open_path(project_path, None, true, cx)
+                })
+                .await
+                .unwrap();
+
+            // This _must_ be the second item registered
+            assert_eq!(
+                handle.serialized_item_kind().unwrap(),
+                TEST_ALTERNATE_PNG_KIND
+            );
+
+            let handle = workspace
+                .update(cx, |workspace, cx| {
+                    let project_path = (worktree_id, "three.txt");
+                    workspace.open_path(project_path, None, true, cx)
+                })
+                .await;
+            assert!(handle.is_err());
+        }
     }
 
     pub fn init_test(cx: &mut TestAppContext) {
