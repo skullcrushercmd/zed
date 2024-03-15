@@ -513,6 +513,9 @@ impl TestServer {
                 zed_client_checksum_seed: None,
                 slack_panics_webhook: None,
                 auto_join_channel_id: None,
+                otel_endpoint: None,
+                otel_api_token: None,
+                otel_dataset: None,
             },
         })
     }

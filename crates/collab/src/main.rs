@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use axum::{extract::MatchedPath, http::Request, routing::get, Extension, Router};
 use collab::{
     api::fetch_extensions_from_blob_store_periodically, db, env, executor::Executor, AppState,
-    Config, MigrateConfig, Result,
+    Config, MigrateConfig, Result, TracingConfig,
 };
 use db::Database;
 use std::{
@@ -46,14 +46,17 @@ async fn main() -> Result<()> {
             } else {
                 (true, true)
             };
-            if !is_api && !is_collab {
-                Err(anyhow!(
+            let service_name = match (is_api, is_collab) {
+                (true, true) => "api-and-collab",
+                (true, false) => "api",
+                (false, true) => "collab",
+                (false, false) => Err(anyhow!(
                     "usage: collab <version | migrate | serve [api|collab]>"
-                ))?;
-            }
+                ))?,
+            };
 
             let config = envy::from_env::<Config>().expect("error loading config");
-            init_tracing(&config);
+            init_tracing(config.tracing_config(), service_name.to_string());
 
             run_migrations().await?;
 
@@ -177,33 +180,82 @@ async fn handle_liveness_probe(Extension(state): Extension<Arc<AppState>>) -> Re
     Ok("ok".to_string())
 }
 
-pub fn init_tracing(config: &Config) -> Option<()> {
+pub fn init_tracing(config: TracingConfig, service_name: String) -> Option<()> {
     use std::str::FromStr;
     use tracing_subscriber::layer::SubscriberExt;
 
-    let filter = EnvFilter::from_str(config.rust_log.as_deref()?).log_err()?;
+    match config {
+        TracingConfig::Log { level, json } => {
+            let filter = EnvFilter::from_str(&level).log_err()?;
 
-    tracing_subscriber::registry()
-        .with(if config.log_json.unwrap_or(false) {
-            Box::new(
-                tracing_subscriber::fmt::layer()
-                    .fmt_fields(JsonFields::default())
-                    .event_format(
-                        tracing_subscriber::fmt::format()
-                            .json()
-                            .flatten_event(true)
-                            .with_span_list(true),
+            tracing_subscriber::registry()
+                .with(if json {
+                    Box::new(
+                        tracing_subscriber::fmt::layer()
+                            .fmt_fields(JsonFields::default())
+                            .event_format(
+                                tracing_subscriber::fmt::format()
+                                    .json()
+                                    .flatten_event(true)
+                                    .with_span_list(true),
+                            )
+                            .with_filter(filter),
+                    ) as Box<dyn Layer<_> + Send + Sync>
+                } else {
+                    Box::new(
+                        tracing_subscriber::fmt::layer()
+                            .event_format(tracing_subscriber::fmt::format().pretty())
+                            .with_filter(filter),
                     )
-                    .with_filter(filter),
-            ) as Box<dyn Layer<_> + Send + Sync>
-        } else {
-            Box::new(
-                tracing_subscriber::fmt::layer()
-                    .event_format(tracing_subscriber::fmt::format().pretty())
-                    .with_filter(filter),
-            )
-        })
-        .init();
+                })
+                .init();
+        }
+        TracingConfig::OpenTelemetry {
+            endpoint,
+            api_token,
+            dataset,
+            environment,
+        } => {
+            use opentelemetry::KeyValue;
+            use opentelemetry_otlp::{new_pipeline, Protocol, WithExportConfig};
+            use opentelemetry_sdk::trace;
+            use tonic::metadata::MetadataMap;
+            use tracing_opentelemetry::OpenTelemetryLayer;
+            use tracing_subscriber::Registry;
+
+            let mut metadata = MetadataMap::new();
+            metadata.insert(
+                "authorization",
+                format!("Bearer {}", api_token).parse().unwrap(),
+            );
+            metadata.insert("x-axiom-dataset", dataset.parse().unwrap());
+
+            let tracer = new_pipeline()
+                .tracing()
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter()
+                        .tonic()
+                        .with_endpoint(endpoint)
+                        .with_metadata(metadata)
+                        .with_protocol(Protocol::Grpc),
+                )
+                .with_trace_config(
+                    trace::config().with_resource(opentelemetry_sdk::Resource::new(vec![
+                        KeyValue::new("service.name", service_name),
+                        KeyValue::new("service.version", REVISION.unwrap_or("unknown").to_string()),
+                        KeyValue::new("service.environment", environment),
+                        KeyValue::new("service.instance.id", uuid::Uuid::new_v4().to_string()),
+                    ])),
+                )
+                .install_batch(opentelemetry_sdk::runtime::Tokio)
+                .expect("Failed to install OpenTelemetry pipeline");
+
+            let telemetry = OpenTelemetryLayer::new(tracer);
+            let subscriber = Registry::default().with(telemetry);
+
+            tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+        }
+    }
 
     None
 }

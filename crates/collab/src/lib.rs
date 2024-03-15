@@ -118,8 +118,6 @@ pub struct Config {
     pub live_kit_server: Option<String>,
     pub live_kit_key: Option<String>,
     pub live_kit_secret: Option<String>,
-    pub rust_log: Option<String>,
-    pub log_json: Option<bool>,
     pub blob_store_url: Option<String>,
     pub blob_store_region: Option<String>,
     pub blob_store_access_key: Option<String>,
@@ -129,12 +127,54 @@ pub struct Config {
     pub zed_client_checksum_seed: Option<String>,
     pub slack_panics_webhook: Option<String>,
     pub auto_join_channel_id: Option<ChannelId>,
+
+    /// Configures the log level (ignored if OpenTelemetry collection is enabled)
+    pub rust_log: Option<String>,
+    /// Logs JSON instead of a pretty format (ignored if OpenTelemetry collection is enabled)
+    pub log_json: Option<bool>,
+
+    /// OpenTelemetry configuration. All 3 fields must be specified to enable OpenTelemetry collection.
+    pub otel_endpoint: Option<String>,
+    pub otel_api_token: Option<String>,
+    pub otel_dataset: Option<String>,
 }
 
 impl Config {
     pub fn is_development(&self) -> bool {
         self.zed_environment == "development".into()
     }
+
+    pub fn tracing_config(&self) -> TracingConfig {
+        match (
+            &self.otel_endpoint,
+            &self.otel_api_token,
+            &self.otel_dataset,
+        ) {
+            (Some(endpoint), Some(api_token), Some(dataset)) => TracingConfig::OpenTelemetry {
+                endpoint: endpoint.clone(),
+                api_token: api_token.clone(),
+                dataset: dataset.clone(),
+                environment: self.zed_environment.clone(),
+            },
+            _ => TracingConfig::Log {
+                level: self.rust_log.clone().unwrap_or_else(|| "info".to_string()),
+                json: self.log_json.unwrap_or(false),
+            },
+        }
+    }
+}
+
+pub enum TracingConfig {
+    Log {
+        level: String,
+        json: bool,
+    },
+    OpenTelemetry {
+        endpoint: String,
+        api_token: String,
+        dataset: String,
+        environment: Arc<str>,
+    },
 }
 
 #[derive(Default, Deserialize)]
