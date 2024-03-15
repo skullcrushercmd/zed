@@ -74,6 +74,11 @@ pub fn init(cx: &mut AppContext) {
         |workspace: &mut Workspace, _cx: &mut ViewContext<Workspace>| {
             workspace
                 .register_action(|workspace, _: &ToggleFocus, cx| {
+                    let settings = AssistantSettings::get_global(cx);
+                    if !settings.button {
+                        return;
+                    }
+
                     workspace.toggle_panel_focus::<AssistantPanel>(cx);
                 })
                 .register_action(AssistantPanel::inline_assist)
@@ -237,6 +242,11 @@ impl AssistantPanel {
         _: &InlineAssist,
         cx: &mut ViewContext<Workspace>,
     ) {
+        let settings = AssistantSettings::get_global(cx);
+        if !settings.button {
+            return;
+        }
+
         let Some(assistant) = workspace.panel::<AssistantPanel>(cx) else {
             return;
         };
