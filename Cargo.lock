@@ -343,6 +343,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "collections",
+ "command_palette_hooks",
  "ctor",
  "editor",
  "env_logger",

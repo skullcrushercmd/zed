@@ -10,13 +10,17 @@ pub use assistant_panel::AssistantPanel;
 use assistant_settings::OpenAiModel;
 use chrono::{DateTime, Local};
 use collections::HashMap;
+use command_palette_hooks::CommandPaletteFilter;
 use fs::Fs;
 use futures::StreamExt;
-use gpui::{actions, AppContext, SharedString};
+use gpui::{actions, AppContext, Global, SharedString};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use settings::{Settings, SettingsStore};
 use std::{cmp::Reverse, ffi::OsStr, path::PathBuf, sync::Arc};
 use util::paths::CONVERSATIONS_DIR;
+
+use crate::assistant_settings::AssistantSettings;
 
 actions!(
     assistant,
@@ -117,8 +121,56 @@ impl SavedConversationMetadata {
     }
 }
 
+/// The state pertaining to the Assistant.
+#[derive(Default)]
+struct Assistant {
+    /// Whether the Assistant is enabled.
+    enabled: bool,
+}
+
+impl Global for Assistant {}
+
+impl Assistant {
+    const NAMESPACE: &'static str = "assistant";
+
+    fn set_enabled(&mut self, enabled: bool, cx: &mut AppContext) {
+        if self.enabled == enabled {
+            return;
+        }
+
+        if !enabled {
+            cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
+                filter.hidden_namespaces.insert(Self::NAMESPACE);
+            });
+
+            return;
+        }
+
+        cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
+            filter.hidden_namespaces.remove(Self::NAMESPACE);
+        });
+    }
+}
+
 pub fn init(cx: &mut AppContext) {
     assistant_panel::init(cx);
+
+    cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
+        filter.hidden_namespaces.insert(Assistant::NAMESPACE);
+    });
+    cx.update_global(|assistant: &mut Assistant, cx: &mut AppContext| {
+        let settings = AssistantSettings::get_global(cx);
+
+        assistant.set_enabled(settings.button, cx);
+    });
+    cx.observe_global::<SettingsStore>(|cx| {
+        cx.update_global(|assistant: &mut Assistant, cx: &mut AppContext| {
+            let settings = AssistantSettings::get_global(cx);
+
+            assistant.set_enabled(settings.button, cx);
+        });
+    })
+    .detach();
 }
 
 #[cfg(test)]
