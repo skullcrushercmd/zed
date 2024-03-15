@@ -2407,6 +2407,7 @@ name = "command_palette_hooks"
 version = "0.1.0"
 dependencies = [
  "collections",
+ "derive_more",
  "gpui",
 ]
 
@@ -5338,6 +5339,7 @@ dependencies = [
  "tree-sitter-zig",
  "unindent",
  "util",
+ "workspace",
 ]
 
 [[package]]
@@ -6091,6 +6093,7 @@ dependencies = [
  "async-trait",
  "futures 0.3.28",
  "log",
+ "semver",
  "serde",
  "serde_json",
  "smol",
@@ -7600,9 +7603,11 @@ dependencies = [
 name = "recent_projects"
 version = "0.1.0"
 dependencies = [
+ "collections",
  "editor",
  "fuzzy",
  "gpui",
+ "itertools 0.11.0",
  "language",
  "menu",
  "ordered-float 2.10.0",

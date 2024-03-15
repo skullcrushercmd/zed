@@ -10,6 +10,7 @@ mod mode_indicator;
 mod motion;
 mod normal;
 mod object;
+mod replace;
 mod state;
 mod utils;
 mod visual;
@@ -29,6 +30,7 @@ use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
 use normal::normal_replace;
+use replace::multi_replace;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_derive::Serialize;
@@ -85,8 +87,8 @@ pub fn init(cx: &mut AppContext) {
     // Any time settings change, update vim mode to match. The Vim struct
     // will be initialized as disabled by default, so we filter its commands
     // out when starting up.
-    cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-        filter.hidden_namespaces.insert("vim");
+    CommandPaletteFilter::update_global(cx, |filter, _| {
+        filter.hide_namespace(Vim::NAMESPACE);
     });
     cx.update_global(|vim: &mut Vim, cx: &mut AppContext| {
         vim.set_enabled(VimModeSetting::get_global(cx).0, cx)
@@ -104,8 +106,8 @@ fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
         Vim::update(cx, |vim, cx| vim.switch_mode(mode, false, cx))
     });
     workspace.register_action(
-        |_: &mut Workspace, &PushOperator(operator): &PushOperator, cx| {
-            Vim::update(cx, |vim, cx| vim.push_operator(operator, cx))
+        |_: &mut Workspace, PushOperator(operator): &PushOperator, cx| {
+            Vim::update(cx, |vim, cx| vim.push_operator(operator.clone(), cx))
         },
     );
     workspace.register_action(|_: &mut Workspace, n: &Number, cx: _| {
@@ -132,6 +134,7 @@ fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
     insert::register(workspace, cx);
     motion::register(workspace, cx);
     command::register(workspace, cx);
+    replace::register(workspace, cx);
     object::register(workspace, cx);
     visual::register(workspace, cx);
 }
@@ -188,6 +191,9 @@ struct Vim {
 impl Global for Vim {}
 
 impl Vim {
+    /// The namespace for Vim actions.
+    const NAMESPACE: &'static str = "vim";
+
     fn read(cx: &mut AppContext) -> &Self {
         cx.global::<Self>()
     }
@@ -418,6 +424,11 @@ impl Vim {
                         if selection.is_empty() {
                             selection.end = movement::right(map, selection.start);
                         }
+                    } else if last_mode == Mode::Replace {
+                        if selection.head().column() != 0 {
+                            let point = movement::left(map, selection.head());
+                            selection.collapse_to(point, selection.goal)
+                        }
                     }
                 });
             })
@@ -485,7 +496,7 @@ impl Vim {
     }
 
     fn active_operator(&self) -> Option<Operator> {
-        self.state().operator_stack.last().copied()
+        self.state().operator_stack.last().cloned()
     }
 
     fn transaction_begun(&mut self, transaction_id: TransactionId, _: &mut WindowContext) {
@@ -608,7 +619,10 @@ impl Vim {
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => visual_replace(text, cx),
                 _ => Vim::update(cx, |vim, cx| vim.clear_operator(cx)),
             },
-            _ => {}
+            _ => match Vim::read(cx).state().mode {
+                Mode::Replace => multi_replace(text, cx),
+                _ => {}
+            },
         }
     }
 
@@ -617,21 +631,23 @@ impl Vim {
             return;
         }
         if !enabled {
-            let _ = cx.remove_global::<CommandPaletteInterceptor>();
-            cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-                filter.hidden_namespaces.insert("vim");
+            CommandPaletteInterceptor::update_global(cx, |interceptor, _| {
+                interceptor.clear();
+            });
+            CommandPaletteFilter::update_global(cx, |filter, _| {
+                filter.hide_namespace(Self::NAMESPACE);
             });
             *self = Default::default();
             return;
         }
 
         self.enabled = true;
-        cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-            filter.hidden_namespaces.remove("vim");
+        CommandPaletteFilter::update_global(cx, |filter, _| {
+            filter.show_namespace(Self::NAMESPACE);
         });
-        cx.set_global::<CommandPaletteInterceptor>(CommandPaletteInterceptor(Box::new(
-            command::command_interceptor,
-        )));
+        CommandPaletteInterceptor::update_global(cx, |interceptor, _| {
+            interceptor.set(Box::new(command::command_interceptor));
+        });
 
         if let Some(active_window) = cx
             .active_window()
