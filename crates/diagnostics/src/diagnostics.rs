@@ -23,6 +23,7 @@ use language::{
     SelectionGoal,
 };
 use lsp::LanguageServerId;
+use multi_buffer::Event as MultiBufferEvent;
 use project::{DiagnosticSummary, Project, ProjectPath};
 use project_diagnostics_settings::ProjectDiagnosticsSettings;
 use settings::Settings;
@@ -157,6 +158,15 @@ impl ProjectDiagnosticsEditor {
                 project_handle.read(cx).capability(),
             )
         });
+
+        let excerpts_subscription =
+            cx.subscribe(&excerpts, |this, _buffer, event: &MultiBufferEvent, cx| {
+                if let MultiBufferEvent::ExcerptsRemoved { .. } = event {
+                    dbg!();
+                    this.update_excerpts(None, cx);
+                }
+            });
+
         let editor = cx.new_view(|cx| {
             let mut editor =
                 Editor::for_multibuffer(excerpts.clone(), Some(project_handle.clone()), cx);
@@ -188,6 +198,7 @@ impl ProjectDiagnosticsEditor {
                 project_event_subscription,
                 editor_event_subscription,
                 focus_in_subscription,
+                excerpts_subscription,
             ],
         };
         this.update_excerpts(None, cx);

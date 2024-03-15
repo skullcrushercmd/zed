@@ -3097,6 +3097,7 @@ dependencies = [
  "language",
  "log",
  "lsp",
+ "multi_buffer",
  "project",
  "schemars",
  "serde",
