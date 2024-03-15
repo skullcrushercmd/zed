@@ -139,24 +139,25 @@ impl Assistant {
         }
 
         if !enabled {
-            cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-                filter.hidden_namespaces.insert(Self::NAMESPACE);
+            CommandPaletteFilter::update_global(cx, |filter, _cx| {
+                filter.hide_namespace(Self::NAMESPACE);
             });
 
             return;
         }
 
-        cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-            filter.hidden_namespaces.remove(Self::NAMESPACE);
+        CommandPaletteFilter::update_global(cx, |filter, _cx| {
+            filter.show_namespace(Self::NAMESPACE);
         });
     }
 }
 
 pub fn init(cx: &mut AppContext) {
+    cx.set_global(Assistant::default());
     assistant_panel::init(cx);
 
-    cx.update_global::<CommandPaletteFilter, _>(|filter, _| {
-        filter.hidden_namespaces.insert(Assistant::NAMESPACE);
+    CommandPaletteFilter::update_global(cx, |filter, _cx| {
+        filter.hide_namespace(Assistant::NAMESPACE);
     });
     cx.update_global(|assistant: &mut Assistant, cx: &mut AppContext| {
         let settings = AssistantSettings::get_global(cx);
