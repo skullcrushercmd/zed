@@ -5,7 +5,7 @@ use text::{Anchor, BufferId, BufferSnapshot, OffsetRangeExt, Point};
 pub use git2 as libgit;
 use libgit::{DiffLineType as GitDiffLineType, DiffOptions as GitOptions, Patch as GitPatch};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiffHunkStatus {
     Added,
     Modified,
