@@ -2770,6 +2770,7 @@ fn try_click_diff_hunk(
                 buffer_snapshot.anchor_at(buffer_range.start, Bias::Left)
                     ..buffer_snapshot.anchor_at(buffer_range.end, Bias::Left),
                 Some(cx.theme().status().git().created),
+                false,
                 cx,
             );
         }
@@ -2787,6 +2788,7 @@ fn try_click_diff_hunk(
                 buffer_snapshot.anchor_at(buffer_range.start, Bias::Left)
                     ..buffer_snapshot.anchor_at(buffer_range.end, Bias::Left),
                 Some(cx.theme().status().git().created),
+                false,
                 cx,
             );
         }

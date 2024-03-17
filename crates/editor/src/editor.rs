@@ -393,7 +393,7 @@ pub struct Editor {
     show_wrap_guides: Option<bool>,
     placeholder_text: Option<Arc<str>>,
     highlight_order: usize,
-    highlighted_rows: HashMap<TypeId, Vec<(usize, Range<Anchor>, Hsla)>>,
+    highlighted_rows: HashMap<TypeId, Vec<(usize, bool, Range<Anchor>, Hsla)>>,
     background_highlights: BTreeMap<TypeId, BackgroundHighlight>,
     nav_history: Option<ItemNavHistory>,
     context_menu: RwLock<Option<ContextMenu>>,
@@ -9029,6 +9029,7 @@ impl Editor {
         &mut self,
         rows: Range<Anchor>,
         color: Option<Hsla>,
+        autoscroll: bool,
         cx: &mut ViewContext<Self>,
     ) {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
@@ -9036,7 +9037,7 @@ impl Editor {
             hash_map::Entry::Occupied(o) => {
                 let row_highlights = o.into_mut();
                 let existing_highlight_index =
-                    row_highlights.binary_search_by(|(_, highlight_range, _)| {
+                    row_highlights.binary_search_by(|(_, _, highlight_range, _)| {
                         highlight_range
                             .start
                             .cmp(&rows.start, &multi_buffer_snapshot)
@@ -9050,7 +9051,7 @@ impl Editor {
                         };
                         row_highlights.insert(
                             insert_index,
-                            (post_inc(&mut self.highlight_order), rows, color),
+                            (post_inc(&mut self.highlight_order), autoscroll, rows, color),
                         );
                     }
                     None => {
@@ -9062,7 +9063,12 @@ impl Editor {
             }
             hash_map::Entry::Vacant(v) => {
                 if let Some(color) = color {
-                    v.insert(vec![(post_inc(&mut self.highlight_order), rows, color)]);
+                    v.insert(vec![(
+                        post_inc(&mut self.highlight_order),
+                        autoscroll,
+                        rows,
+                        color,
+                    )]);
                 }
             }
         }
@@ -9081,7 +9087,7 @@ impl Editor {
             self.highlighted_rows
                 .get(&TypeId::of::<T>())?
                 .iter()
-                .map(|(_, range, color)| (range, color)),
+                .map(|(_, _, range, color)| (range, color)),
         )
     }
 
@@ -9095,7 +9101,7 @@ impl Editor {
             .flat_map(|(_, highlighted_rows)| highlighted_rows.iter())
             .fold(
                 BTreeMap::<u32, Hsla>::new(),
-                |mut unique_rows, (highlight_order, anchor_range, hsla)| {
+                |mut unique_rows, (highlight_order, _, anchor_range, hsla)| {
                     let start_row = anchor_range.start.to_display_point(&snapshot).row();
                     let end_row = anchor_range.end.to_display_point(&snapshot).row();
                     for row in start_row..=end_row {
@@ -9109,6 +9115,23 @@ impl Editor {
                     unique_rows
                 },
             )
+    }
+
+    pub fn topmost_highlighted_display_row_to_autoscroll_to(
+        &mut self,
+        cx: &mut WindowContext,
+    ) -> Option<u32> {
+        let snapshot = self.snapshot(cx);
+        self.highlighted_rows
+            .iter()
+            .flat_map(|(_, highlighted_rows)| highlighted_rows.iter())
+            .filter(|(_, autoscroll, _, _)| *autoscroll)
+            .flat_map(|(_, _, anchor_range, _)| {
+                let start_row = anchor_range.start.to_display_point(&snapshot).row();
+                let end_row = anchor_range.end.to_display_point(&snapshot).row();
+                start_row..=end_row
+            })
+            .min()
     }
 
     pub fn highlight_background<T: 'static>(

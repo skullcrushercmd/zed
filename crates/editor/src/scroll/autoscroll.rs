@@ -81,8 +81,10 @@ impl Editor {
 
         let mut target_top;
         let mut target_bottom;
-        if let Some(first_highlighted_row) = &self.highlighted_display_rows(cx).first_entry() {
-            target_top = *first_highlighted_row.key() as f32;
+        if let Some(first_highlighted_row) =
+            self.topmost_highlighted_display_row_to_autoscroll_to(cx)
+        {
+            target_top = first_highlighted_row as f32;
             target_bottom = target_top + 1.;
         } else {
             let selections = self.selections.all::<Point>(cx);
